@@ -1,0 +1,53 @@
+# osearch configuration: the settings most people change.
+#
+# Where the file lives: `osearch config path`. Every setting has a tuned
+# default; set only what you want different. `osearch config show` prints all
+# of them with their current values, `osearch config set <section.key> <value>`
+# changes one, and the web UI's Settings page does both. docs/REFERENCE.md
+# explains each one.
+
+[paths]
+# envfile = '/home/you/.config/osearch.env'   # KEY=value lines (API keys) read at start
+# archive = '/home/you/research'              # where runs are kept: <archive>/runs/<id>/
+
+[research]
+# width = 'wide'          # wide: every web engine with balance to spare; standard: about six
+# costcap = 1.0           # estimated USD per run; searches past it are skipped
+# redditaccount = ''      # a spare Reddit login for automated use (`osearch login reddit.com --as spare`)
+# xbird = false           # X search in social mode through your x.com login (runs as your account)
+
+# AI synthesis: off until url and model are set. Any OpenAI-style endpoint
+# (OpenAI, OpenRouter, Ollama, LM Studio) or an Anthropic-style one.
+[synth]
+# api = 'openai'
+# url = 'https://openrouter.ai/api/v1/chat/completions'
+# model = 'a cheap model with a large context window'
+# key = ''
+# inprice = 0.0           # USD per million input tokens, for the cost log
+# outprice = 0.0          # USD per million output tokens
+
+[ui]
+# port = 7820             # `osearch ui` listens on 127.0.0.1 only
+
+# Engine allowances steer which engines run and how often. An engine with no
+# allowance is used freely. kind: monthly (refills on resetday), onetime
+# (amount as of checked) or expiring (gone after expires).
+#
+# [balance.exa]
+# kind = 'monthly'
+# amount = 10.0
+# unit = 'usd'
+# unitprice = 1.0         # USD per unit: turns logged spend into units
+# resetday = 1
+#
+# [balance.serper]
+# kind = 'onetime'
+# amount = 2500
+# unit = 'credits'
+# unitprice = 0.001
+# checked = '2026-01-01'
+
+# API keys normally come from the environment or the envfile; these work too.
+# [keys]
+# exa = ''
+# brave = ''

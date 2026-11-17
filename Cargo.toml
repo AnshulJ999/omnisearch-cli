@@ -1,0 +1,76 @@
+[package]
+name = "omnisearch"
+version = "0.1.0"
+edition = "2021"
+description = "OmniSearch (osearch): one web-research CLI. Based on paperfoot/search-cli (MIT), see UPSTREAM.md"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "osearch"
+path = "src/main.rs"
+
+[features]
+# The stealth rung uses wreq (BoringSSL). On Linux, wreq's prefix-symbols
+# feature (below) keeps BoringSSL's symbols apart from any OpenSSL in the
+# link; --no-default-features drops it, and the chain starts at direct.
+default = ["stealth", "ui"]
+stealth = ["dep:wreq", "dep:wreq-util", "dep:http-body-util"]
+# The web UI (`osearch ui`): a local server with the built page packed in.
+ui = ["dep:axum", "dep:rust-embed"]
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util", "process", "fs", "sync"] }
+# gzip shrinks fetched pages.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2", "charset", "gzip"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+figment = { version = "0.10", features = ["toml", "env"] }
+comfy-table = "7"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+directories = "5"
+async-trait = "0.1"
+indicatif = "0.17"
+backon = "1"
+url = "2.5.8"
+mimalloc = "0.1.48"
+# Chrome advertises gzip, br and zstd; without the decoders a compressed
+# page reads as binary.
+wreq = { version = "=6.0.0-rc.31", features = ["cookies", "gzip", "brotli", "zstd", "deflate"], optional = true }
+wreq-util = { version = "=3.0.0-rc.14", optional = true }
+# Streams the stealth body under the 5 MB cap (already in the tree via wreq).
+http-body-util = { version = "0.1", optional = true }
+hickory-resolver = { version = "0.26", features = ["tokio"] }
+# Page module: article extraction to markdown (dom_smoothie) and whole-page
+# markdown on the same parser (dom_query), charset decoding (encoding_rs).
+dom_smoothie = "0.19"
+dom_query = { version = "0.29", default-features = false, features = ["markdown"] }
+encoding_rs = "0.8"
+uuid = { version = "1", features = ["v4"] }
+http = "1"
+regex = "1"
+chromey = { version = "2", default-features = false }
+futures-util = "0.3"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+axum = { version = "0.8", optional = true }
+rust-embed = { version = "8", features = ["mime-guess"], optional = true }
+
+# BoringSSL and OpenSSL export the same symbol names; prefixing BoringSSL's
+# avoids the clash on Linux (wreq README, rc.29 onwards).
+[target.'cfg(target_os = "linux")'.dependencies]
+wreq = { version = "=6.0.0-rc.31", features = ["prefix-symbols"], optional = true }
+
+# DPAPI for the cookie store.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_Console"] }
+
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = 3

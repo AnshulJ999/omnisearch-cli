@@ -1,0 +1,37 @@
+# cargo-deny gate: advisories, licenses, and registry sources.
+# wreq/wreq-util are pre-release pins inherited from the yanked rquest crate —
+# exactly the dependency class this gate exists to watch.
+
+[advisories]
+yanked = "deny"
+ignore = [
+    # indicatif -> number_prefix: unmaintained formatting helper, no upgrade
+    # published; cosmetic dependency (spinner), not on any network path.
+    "RUSTSEC-2025-0119",
+    # quick-xml 0.38 inside self_update: only its S3 backend parses XML, and
+    # `search update` uses the GitHub backend. Drop once self_update moves.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",
+    "Zlib",
+    "Unicode-3.0",
+    "OpenSSL",
+    "CDLA-Permissive-2.0",
+    # wreq-util (stealth browser emulation profiles) — LGPL is acceptable for
+    # this standalone binary; revisit if the crate is ever vendored/modified.
+    "LGPL-3.0",
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

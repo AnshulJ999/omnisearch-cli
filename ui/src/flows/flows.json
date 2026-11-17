@@ -1,0 +1,101 @@
+[
+  {
+    "id": "run",
+    "title": "A search, start to finish",
+    "intro": "What happens between `osearch \"question\"` (or a request file, or Search in this UI) and the summary. Steps run top to bottom; boxes side by side run at the same time.",
+    "nodes": [
+      { "id": "start", "label": "A request comes in", "kind": "start", "detail": "The quick form (each quoted argument is one question), a request file, or the Search page here. The keys file is read first. Unknown request fields get a warning; a request that overrides a default is noted in the summary.", "settings": ["paths.envfile", "ui.port", "ui.notes"], "code": ["src/main.rs", "src/research.rs: run()", "src/ui/"] },
+      { "id": "plan", "label": "Plan each question", "kind": "step", "detail": "Each question gets its mode (the caller picks it), its engines (by width and what each balance allows), a result count and a cost estimate. Searches past the cost cap are skipped with a warning.", "settings": ["research.width", "research.standard", "research.engines", "research.costcap", "settings.count"], "code": ["src/research.rs: plan_query", "src/budget.rs: pick"] },
+      { "id": "side", "label": "Add side searches", "kind": "step", "detail": "Beside the questions: Reddit and forum searches for community questions, Telegram channels, a GitHub project list beside general and deep questions, alternatives for \"X alternatives\". Each gets a label after its question (q1r, q1f, q1g...).", "settings": ["research.githubminstars", "research.xbird"], "code": ["src/rounds/"] },
+      { "id": "search", "label": "Search every engine at once", "kind": "engine", "detail": "All planned searches go out together. A repeat of the same search within 5 minutes comes from the cache. Every engine's raw answer is saved in the run's raw/ folder.", "settings": [], "code": ["src/engine.rs", "src/cache.rs", "src/run/raw.rs"] },
+      { "id": "rounds", "label": "Searches that need the first answers", "kind": "engine", "detail": "Rounds that start from what came back: subreddits the threads came from, the logged-in Reddit search, forums found or known, GitHub topics, Telegram channels found, alternatives of a project. See the Community flow.", "settings": ["research.redditlogin", "research.redditmin", "research.redditarchive"], "code": ["src/rounds/reddit.rs", "src/rounds/forums.rs", "src/rounds/github.rs", "src/rounds/telegram.rs", "src/rounds/alternatives.rs"] },
+      { "id": "merge", "label": "Merge and rank the results", "kind": "step", "detail": "The same address found by several engines becomes one result. Rank comes from how many engines found it and how high (rank fusion). Loose sources keep only results that carry the question's meaningful words. Saved as results.jsonl.", "settings": ["research.rerank"], "code": ["src/research.rs: UrlRow", "src/relevance.rs", "src/rerank.rs"] },
+      { "id": "count", "label": "Decide how many pages", "kind": "decision", "detail": "A base count by run type, plus more for each question past the third, up to a ceiling. A request asking for fewer than the default gets the default; 0 means search only.", "settings": ["research.fetch", "research.quickfetch", "research.communityfetch", "research.deepfetch", "research.fetchgrow", "research.fetchmax", "research.fetchfloor"], "code": ["src/research.rs: default_fetch"] },
+      { "id": "pick", "label": "Pick the pages", "kind": "decision", "detail": "In order: addresses the request named; the best result of each question and of each same-kind side search; two links found by one engine only; then overall rank. Other-kind side searches (GitHub list, alternatives) share at most a third. Spares stand in for walled sites. Why each was picked: picks.rN.json.", "settings": ["research.telegramslot"], "code": ["src/research.rs: the block after \"Pages:\""] },
+      { "id": "fetch", "label": "Fetch the pages", "kind": "engine", "detail": "Several at once, each through the fetch tiers (see the Fetching flow). The run waits a soft time, or until enough good pages are in, then leaves the rest to a background process. A hard limit stops the slowest.", "settings": ["research.concurrency", "research.softtime", "research.quicksoft", "research.fetchtime", "research.quicktime", "research.redditlivemax"], "code": ["src/research.rs: fetch_all", "src/fetch/mod.rs"] },
+      { "id": "background", "label": "Late pages finish in the background", "kind": "step", "detail": "A separate osearch process fetches what was left (pending.rN.json, marked by fetch.rN.running). `osearch wait <run>` waits for it. Pages that never finish are saved as failed.", "settings": [], "code": ["src/finish.rs", "src/wait.rs"] },
+      { "id": "snowball", "label": "Snowball links", "kind": "step", "detail": "Links that several fetched pages point to are listed, and read when the setting asks for some.", "settings": ["research.snowball"], "code": ["src/research.rs: snowball"] },
+      { "id": "summary", "label": "Write the summary", "kind": "step", "detail": "What the calling agent reads: searches with their counts, top results with snippets and dates, pages with how each was read, coverage, failures and warnings. Saved as summary.md (and summary.rN.md per round).", "settings": ["research.topresults", "research.snippetchars", "research.snippetprefer"], "code": ["src/research.rs: render_summary"] },
+      { "id": "jina", "label": "Jina DeepSearch (deep runs)", "kind": "engine", "detail": "For deep runs, Jina's own research agent runs in the background beside the run; its answer becomes a page when it lands.", "settings": ["jinadeepsearch.modes", "jinadeepsearch.budget", "jinadeepsearch.effort", "jinadeepsearch.wait", "jinadeepsearch.stop"], "code": ["src/jinadeep.rs"] },
+      { "id": "synth", "label": "AI synthesis", "kind": "step", "detail": "A large-context model reads the pages and writes a cited answer; every quote is checked against the pages. See the Synthesis flow.", "settings": ["synth.enabled", "synth.wait"], "code": ["src/synth.rs"] },
+      { "id": "archive", "label": "Everything kept as a run", "kind": "store", "detail": "The run folder holds the request, every raw answer, calls.jsonl, results.jsonl, pages/, the summary and the synthesis. The runs index (runs.jsonl) lists it for `osearch runs` and this UI.", "settings": ["paths.archive"], "code": ["src/run/mod.rs"] }
+    ],
+    "edges": [
+      ["start", "plan"], ["plan", "side"], ["plan", "search"], ["side", "search"], ["search", "rounds"], ["rounds", "merge"], ["search", "merge"],
+      ["merge", "count"], ["count", "pick"], ["pick", "fetch"], ["fetch", "background", "too slow"], ["fetch", "snowball"], ["snowball", "summary"],
+      ["plan", "jina", "deep runs"], ["summary", "synth"], ["synth", "archive"], ["background", "archive"], ["jina", "archive"]
+    ]
+  },
+  {
+    "id": "fetch",
+    "title": "Fetching one page",
+    "intro": "How osearch reads one address. Free and fast first; a tier only runs when the ones before it could not read the page. Every attempt is kept in the page's record.",
+    "nodes": [
+      { "id": "guard", "label": "Public address only", "kind": "decision", "detail": "Private, loopback and link-local addresses are refused, so a page cannot make osearch read this machine or the local network.", "settings": [], "code": ["src/guard.rs"] },
+      { "id": "memory", "label": "Site memory", "kind": "store", "detail": "Fetchers that keep failing on a site are tried last there. On a site that walls every fetcher, the Wayback lookup starts at the same time.", "settings": [], "code": ["src/fetch/memory.rs"] },
+      { "id": "door", "label": "Tier 0: the site's own door", "kind": "engine", "detail": "A site with an API or a clean source: Reddit threads (archive copy first, live with the login when young or incomplete), GitHub, Discourse forums, Telegram, YouTube captions, Bluesky. A not-found here is final.", "settings": ["research.redditlive", "research.redditaccount", "research.redditmainmax", "tools.ytdlp"], "code": ["src/fetch/sites.rs"] },
+      { "id": "logged", "label": "Logged-in sites: built-in first", "kind": "decision", "detail": "For a site with a saved login, the built-in fetchers go first with its cookies.", "settings": [], "code": ["src/cookies.rs", "src/fetch/mod.rs: builtin"] },
+      { "id": "forum", "label": "Forum threads: two readers at once", "kind": "decision", "detail": "On a forum-thread address, donsetch and the built-in fetchers run together and the copy with more words is kept: each loses replies on some forum software.", "settings": ["research.forumboth"], "code": ["src/fetch/mod.rs: chain", "src/rounds/forums.rs: thread_like"] },
+      { "id": "donsetch", "label": "Tier 1: donsetch", "kind": "engine", "detail": "An outside reader with a browser fingerprint and challenge solving. Reads most pages.", "settings": ["tools.donsetch"], "code": ["src/fetch/donsetch.rs"] },
+      { "id": "builtin", "label": "Tier 1: direct, then stealth", "kind": "engine", "detail": "osearch's own HTTP fetch and converter; when refused, the stealth fetcher with a browser's TLS fingerprint.", "settings": [], "code": ["src/fetch/mod.rs: direct, stealth", "src/fetch/convert.rs"] },
+      { "id": "browser", "label": "Tier 2: browsers, racing", "kind": "engine", "detail": "For pages built by JavaScript: the light browser and Chromium start together (Jina's reader joins the race); the first good copy wins. Skipped on bot walls.", "settings": ["tools.lightbrowser", "tools.moli", "tools.obscura", "tools.chromium"], "code": ["src/fetch/browser.rs"] },
+      { "id": "hard", "label": "Tier 3: hard walls", "kind": "engine", "detail": "crawl4ai with a browser profile, and Jina's reader, racing.", "settings": ["tools.crwl", "tools.crwlprofile"], "code": ["src/fetch/mod.rs: chain"] },
+      { "id": "paid", "label": "Paid reader", "kind": "engine", "detail": "Firecrawl, unless the request keeps paid readers out. It serves a cached copy under two days old unless the read is fresh.", "settings": [], "code": ["src/fetch/mod.rs: hosted_reader"] },
+      { "id": "check", "label": "Is it really the page?", "kind": "decision", "detail": "Every copy is checked: too little text, a challenge page, a sign-in page, a forum error page, or a deep address that landed on the site's front page (the page is gone). A failed check sends the page on to the next tier.", "settings": [], "code": ["src/fetch/mod.rs: check", "src/page/"] },
+      { "id": "wayback", "label": "Wayback Machine", "kind": "engine", "detail": "When every tier failed (gone, walled, behind a login or a soft paywall), the archived copy is read and stamped with its date.", "settings": [], "code": ["src/fetch/wayback.rs"] },
+      { "id": "saved", "label": "Saved with a stamp", "kind": "store", "detail": "The page's markdown goes to pages/pN.md with a Source line (read live, cache or archive copy, its date) and its outline of sections; failures are saved with their reason.", "settings": [], "code": ["src/research.rs: stamped", "src/run/mod.rs: save_page"] }
+    ],
+    "edges": [
+      ["guard", "memory"], ["memory", "door"], ["door", "logged", "not this door"], ["door", "check"], ["logged", "forum"], ["forum", "donsetch"], ["donsetch", "builtin", "refused or JS"], ["builtin", "browser", "JS page"],
+      ["browser", "hard", "still nothing"], ["hard", "paid"], ["donsetch", "check"], ["builtin", "check"], ["browser", "check"], ["hard", "check"], ["paid", "check"], ["paid", "wayback", "all failed"], ["check", "saved"], ["wayback", "saved"]
+    ]
+  },
+  {
+    "id": "community",
+    "title": "A community question",
+    "intro": "What a question in community mode searches, beside the usual web engines. Everything here runs at once except the boxes that need first answers.",
+    "nodes": [
+      { "id": "q", "label": "Community question (q1)", "kind": "start", "detail": "The caller chose community mode: real people's experience matters more than articles.", "settings": [], "code": ["src/rounds/mod.rs"] },
+      { "id": "rss", "label": "Reddit's own search", "kind": "engine", "detail": "The `reddit` engine: Reddit's search feed without a login (one request a minute per address). When Reddit refuses it, a web search of reddit.com answers instead, and the summary says it cannot apply a date limit.", "settings": [], "code": ["src/providers/reddit.rs"] },
+      { "id": "web", "label": "Web engines on reddit.com (q1r)", "kind": "engine", "detail": "Brave and You.com limited to reddit.com (Exa returns nothing for that domain).", "settings": [], "code": ["src/rounds/reddit.rs: web"] },
+      { "id": "subs", "label": "Inside subreddits (q1a1..)", "kind": "engine", "detail": "Subreddits the request names, the two its threads came from most, and ones a free search names; with the login it is Reddit's own search inside each. The archive's title search there is a setting (it times out on its server).", "settings": ["research.redditaccount", "research.redditarchive"], "code": ["src/rounds/reddit.rs"] },
+      { "id": "login", "label": "Logged-in Reddit search (q1l)", "kind": "engine", "detail": "Old Reddit's search with the saved login. The run's own account goes first; the main login steps in when it fails.", "settings": ["research.redditlogin", "research.redditmin", "research.redditmainmax"], "code": ["src/providers/reddit.rs: parse_login_search"] },
+      { "id": "forums", "label": "Forums (q1f, q1p)", "kind": "engine", "detail": "Google's forum filter through SerpApi (Serper when it cannot run, else a forum-word query on Brave), and a meaning-based angle on Parallel.", "settings": [], "code": ["src/rounds/forums.rs: side"] },
+      { "id": "more", "label": "Discussions, Lemmy, known forums (q1d, q1m, q1k)", "kind": "engine", "detail": "GitHub Discussions, Lemmy, and forums searched directly: forum hosts this run found, plus built-in forums whose topic words match the question.", "settings": ["tools.gh"], "code": ["src/rounds/forums.rs: round"] },
+      { "id": "tg", "label": "Telegram (q1n, q1n1..)", "kind": "engine", "detail": "Public channels found with site:t.me, then a search inside the two found most.", "settings": ["research.telegramslot"], "code": ["src/rounds/telegram.rs"] },
+      { "id": "gh", "label": "GitHub projects (q1g)", "kind": "engine", "detail": "A list of matching repositories beside the question, ordered by stars.", "settings": ["research.githubminstars"], "code": ["src/rounds/github.rs"] },
+      { "id": "x", "label": "X (social mode)", "kind": "engine", "detail": "X search through the saved x.com login, in social mode only and only when switched on: it runs as the real account.", "settings": ["research.xbird"], "code": ["vendor/bird-search"] },
+      { "id": "threads", "label": "Threads read", "kind": "step", "detail": "Picked Reddit threads are read from the archive first (free, complete for older threads); young or incomplete ones live with the login, up to a limit per round.", "settings": ["research.communityfetch", "research.redditlivemax"], "code": ["src/fetch/sites.rs"] }
+    ],
+    "edges": [
+      ["q", "rss"], ["q", "web"], ["q", "forums"], ["q", "tg"], ["q", "gh"], ["q", "x"], ["rss", "subs", "threads came from"], ["web", "subs"], ["rss", "login"], ["forums", "more", "forums found"], ["subs", "threads"], ["login", "threads"], ["more", "threads"], ["tg", "threads"], ["gh", "threads"]
+    ]
+  },
+  {
+    "id": "synth",
+    "title": "AI synthesis",
+    "intro": "How a model turns a run's pages into a cited answer, and how osearch checks it.",
+    "nodes": [
+      { "id": "want", "label": "Does this run get one?", "kind": "decision", "detail": "Off until an endpoint and model are set. Then the request can ask for it or not; otherwise the settings decide by run type.", "settings": ["synth.enabled", "synth.quick", "synth.requests", "synth.deep", "synth.url", "synth.model"], "code": ["src/synth.rs: wanted"] },
+      { "id": "wait", "label": "Wait or background", "kind": "decision", "detail": "Wait prints summary and synthesis together; background prints the summary first and `osearch wait <run>` tells when it is ready.", "settings": ["synth.wait"], "code": ["src/synth.rs: after_run"] },
+      { "id": "material", "label": "Gather the material", "kind": "step", "detail": "Every read page (whole, or its best sections when the material is too long), each page capped; engines' own answers marked unverified; snippets of results that were not read. Near-copies of another page can be left out.", "settings": ["synth.pages", "synth.maxinput", "synth.pagecap", "synth.answers", "synth.snippets", "research.dedupe", "research.dedupemin", "research.snippetprefer"], "code": ["src/synth.rs: material"] },
+      { "id": "call", "label": "Ask the model", "kind": "engine", "detail": "One call to the endpoint in its API style, with the prompt and the material. Dropped connections are retried with the same session id.", "settings": ["synth.api", "synth.key", "synth.effort", "synth.maxtokens", "synth.timeout", "synth.prompt"], "code": ["src/synth.rs: synthesize_inner", "prompts/synth.md"] },
+      { "id": "checkq", "label": "Check every quote", "kind": "decision", "detail": "Each quote is looked up word for word in the page it cites; each citation to a section that does not exist is flagged. The answer shows how many quotes were found.", "settings": [], "code": ["src/synth.rs: check"] },
+      { "id": "cost", "label": "Log the cost", "kind": "store", "detail": "The endpoint's own figure when it gives one, else token counts times the configured prices or price list.", "settings": ["synth.inprice", "synth.outprice", "synth.prices"], "code": ["src/synth.rs: prices"] },
+      { "id": "show", "label": "Show it", "kind": "store", "detail": "Saved as synthesis.md; the agent is shown the full answer, the short one, or both (the model marks them with tags).", "settings": ["synth.show", "synth.shorttag", "synth.fulltag"], "code": ["src/synth.rs: render"] }
+    ],
+    "edges": [["want", "wait"], ["wait", "material"], ["material", "call"], ["call", "checkq"], ["checkq", "cost"], ["checkq", "show"]]
+  },
+  {
+    "id": "crawl",
+    "title": "Crawling a docs site",
+    "intro": "`osearch crawl <docs url>`: a whole site into one run, for docs an agent will read section by section.",
+    "nodes": [
+      { "id": "llms", "label": "llms.txt first", "kind": "decision", "detail": "A site's llms-full.txt or llms.txt is the cleanest source when it lists the pages (a short llms.txt is not a site map).", "settings": [], "code": ["src/crawl.rs"] },
+      { "id": "sitemap", "label": "Then the sitemap", "kind": "step", "detail": "The sitemap at the root or in the docs folder.", "settings": [], "code": ["src/crawl.rs"] },
+      { "id": "map", "label": "Then donsetch's map, or the page's links", "kind": "step", "detail": "donsetch maps the site; failing that, the first page's own links (one level).", "settings": [], "code": ["src/crawl.rs: donsetch_map"] },
+      { "id": "read", "label": "Read every page", "kind": "engine", "detail": "Each page through the fetch tiers, several at once, into one run you read with `osearch read` and `osearch grep`.", "settings": [], "code": ["src/crawl.rs", "src/fetch/mod.rs"] }
+    ],
+    "edges": [["llms", "sitemap", "no list"], ["sitemap", "map", "no sitemap"], ["llms", "read"], ["sitemap", "read"], ["map", "read"]]
+  }
+]

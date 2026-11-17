@@ -1,0 +1,7 @@
+/target
+/ui/node_modules
+/ui/dist
+/build.local.sh
+.claude/
+.DS_Store
+**/.DS_Store
