@@ -118,6 +118,9 @@ pub enum Commands {
         /// Wait for a synthesis already running in the background and print it
         #[arg(long)]
         wait: bool,
+        /// Read every round of the run (default: the latest round, with earlier rounds as their own answers)
+        #[arg(long)]
+        all: bool,
     },
 
     /// Wait for a run's background work (late pages, a background synthesis), then print what landed. Start it as a background command: its exit is the notice
@@ -215,6 +218,9 @@ pub enum Commands {
         find: Option<String>,
         #[arg(long, default_value = "20")]
         limit: usize,
+        /// Compress the raw engine answers and results index of runs older than `research.compressafter` days
+        #[arg(long)]
+        compress: bool,
     },
 
     /// Log in to a site in a browser window; its cookies are used at every tier

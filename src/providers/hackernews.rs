@@ -262,6 +262,9 @@ fn search_params(call: &Call<'_>) -> Vec<(&'static str, String)> {
         ("query", query.join(" ")),
         ("tags", "(story,comment)".to_string()),
         ("hitsPerPage", call.count.to_string()),
+        // Algolia matches every word, so a long keyword query can find
+        // nothing; drop words from the end until something matches.
+        ("removeWordsIfNoResults", "lastWords".to_string()),
     ];
     if let Some(days) = call
         .opts

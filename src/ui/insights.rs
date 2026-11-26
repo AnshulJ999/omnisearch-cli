@@ -91,7 +91,7 @@ fn mark(dir: &Path) -> u64 {
 }
 
 fn lines<T: for<'de> Deserialize<'de>>(path: &Path) -> Vec<T> {
-    std::fs::read_to_string(path)
+    crate::run::read_text(path)
         .map(|t| t.lines().filter_map(|l| serde_json::from_str(l).ok()).collect())
         .unwrap_or_default()
 }

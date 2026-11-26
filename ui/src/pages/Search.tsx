@@ -6,7 +6,7 @@ import { toast } from "sonner";
 import { Badge, Button, Card, CardHead, Empty, Input, Label, PageHeader, Select } from "@/components/ui";
 import { get, post } from "@/lib/api";
 import { ago, cn, runTime, usd } from "@/lib/format";
-import type { Job, QueryIn, RequestFile, RunRow } from "@/lib/types";
+import type { Info, Job, QueryIn, RequestFile, RunRow } from "@/lib/types";
 
 const MODES = ["general", "community", "news", "code", "deep", "academic", "forums", "social", "people", "scholar", "shopping"];
 
@@ -64,6 +64,8 @@ export default function SearchPage() {
     }
   }, [draft]);
 
+  const info = useQuery({ queryKey: ["info"], queryFn: () => get<Info>("/info") });
+  const noSynth = info.data ? !info.data.synth_configured : false;
   const jobs = useQuery({ queryKey: ["jobs"], queryFn: () => get<Job[]>("/jobs"), refetchInterval: (q) => (q.state.data?.some((j) => !j.ended) ? 1500 : false) });
   const start = useMutation({
     mutationFn: (body: Record<string, unknown>) => post<{ id: number }>("/jobs", body),
@@ -79,7 +81,7 @@ export default function SearchPage() {
   return (
     <>
       <PageHeader title="Search" sub="Each question searches every web engine at once, reads the best pages, and keeps everything as a run." />
-      <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_380px]">
+      <div className="grid items-start gap-6 xl:grid-cols-[minmax(0,1fr)_380px]">
         <Card>
           <form
             className="space-y-4 p-4"
@@ -141,8 +143,8 @@ export default function SearchPage() {
                 <Field label="Pages to read" hint="Below the default is raised to it; 0 searches only.">
                   <Input type="number" min={0} value={draft.fetch} placeholder="Default" onChange={(e) => setDraft({ ...draft, fetch: e.target.value })} />
                 </Field>
-                <Field label="AI synthesis">
-                  <Select value={draft.synth} onChange={(e) => setDraft({ ...draft, synth: e.target.value })}>
+                <Field label="AI synthesis" hint={noSynth ? "Not set up: set synth.url and synth.model in Settings." : undefined}>
+                  <Select value={noSynth ? "off" : draft.synth} disabled={noSynth} onChange={(e) => setDraft({ ...draft, synth: e.target.value })}>
                     <option value="">Default</option>
                     <option value="on">On</option>
                     <option value="off">Off</option>
@@ -321,7 +323,7 @@ function RecentRuns() {
               <Link to={`/runs/${encodeURIComponent(r.id)}`} className="block px-4 py-2.5 hover:bg-panel-2">
                 <div className="truncate text-sm">{r.topic || r.id}</div>
                 <div className={cn("mt-0.5 text-xs text-muted tabular")}>
-                  {ago(runTime(r.id))} · {r.pages} pages · {usd(r.cost_usd)}
+                  {ago(runTime(r.id))} · {r.pages} {r.pages === 1 ? "page" : "pages"} · {usd(r.cost_usd)}
                 </div>
               </Link>
             </li>

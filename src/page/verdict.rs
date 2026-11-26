@@ -365,6 +365,9 @@ fn has_challenge_marker(lower: &str) -> bool {
         "captcha-delivery.com", // DataDome
         "px-captcha",           // PerimeterX / HUMAN
         "sorry, you have been blocked", // Cloudflare's block page
+        // The same page through a hosted reader, which drops its title.
+        "why have i been blocked?",
+        "the cloudflare ray id found at the bottom of this page",
     ];
     if PLAIN.iter().any(|m| lower.contains(m)) {
         return true;

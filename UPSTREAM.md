@@ -4,6 +4,10 @@ Base: [paperfoot/search-cli](https://github.com/paperfoot/search-cli) (MIT), cra
 
 Check upstream monthly (`gh api repos/paperfoot/search-cli/commits`) and cherry-pick useful engine or page-verdict fixes by hand.
 
+Last checked 2026-11-26, up to v0.14.1 (`2026-11-20`). Taken: Hacker News drops trailing words when a long query matches nothing (`removeWordsIfNoResults`); the DNS resolver's patched release (`hickory-resolver` 0.26.4, used by `osearch verify`). Already here: X's 40 s wait. Left: posts mixed into every web search, and the hosted-service changes (removed here).
+
+The outside tools move faster than search-cli: donsetch went 5.2.1 to 5.5.12 in the same weeks (output contract unchanged; its search now also asks Exa and Parallel through their keyless endpoints, which osearch switches off when its own Exa or Parallel key is set, so one engine's answer never counts as two engines agreeing).
+
 ## Removed
 
 - metasearch.sh: `auth.rs`, `hosted.rs`, the hosted adapter and routing in the engine, rerank, `login`/`logout`/`whoami`, Reddit's hosted global search.

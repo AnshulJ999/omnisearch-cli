@@ -102,18 +102,25 @@ impl Ran {
 /// Run `tool args` with a hard time limit; the process is killed on expiry.
 /// The call goes into the run's call log and its stdout into `raw/`.
 pub async fn run(tool: Tool, args: &[String], timeout: Duration) -> Result<Ran, String> {
-    let path = locate(tool).ok_or_else(|| format!("{} is not installed", tool.name()))?;
-    run_path(tool.name(), &path, args, timeout).await
+    run_env(tool, args, timeout, &[]).await
 }
 
-pub async fn run_path(
+/// `run` with extra environment variables for the tool.
+pub async fn run_env(tool: Tool, args: &[String], timeout: Duration, env: &[(&str, &str)]) -> Result<Ran, String> {
+    let path = locate(tool).ok_or_else(|| format!("{} is not installed", tool.name()))?;
+    run_path(tool.name(), &path, args, timeout, env).await
+}
+
+async fn run_path(
     label: &str,
     path: &Path,
     args: &[String],
     timeout: Duration,
+    env: &[(&str, &str)],
 ) -> Result<Ran, String> {
     let started = Instant::now();
     let mut cmd = tokio::process::Command::new(path);
+    cmd.envs(env.iter().copied());
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -192,7 +199,13 @@ pub async fn version(tool: Tool) -> Option<String> {
         .ok()?;
     let text = String::from_utf8_lossy(&out.stdout).into_owned()
         + &String::from_utf8_lossy(&out.stderr);
-    let first = text.lines().map(str::trim).find(|l| !l.is_empty())?;
+    // Decorated banners: drop leading symbols and the build target.
+    let first = text
+        .lines()
+        .map(|l| l.trim().trim_start_matches(|c: char| !c.is_alphanumeric()).trim())
+        .find(|l| !l.is_empty())?;
+    let first = first.split_whitespace().filter(|w| !w.contains("-pc-") && !w.contains("-apple-") && !w.contains("-linux-")).collect::<Vec<_>>().join(" ");
+    let first = first.as_str();
     Some(if first.starts_with("Usage") {
         "installed".to_string()
     } else {

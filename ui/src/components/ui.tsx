@@ -112,7 +112,8 @@ export function Switch({ checked, onChange, label }: { checked: boolean; onChang
 export function Tabs({ value, onChange, items, children }: { value: string; onChange: (v: string) => void; items: { value: string; label: React.ReactNode }[]; children: React.ReactNode }) {
   return (
     <T.Root value={value} onValueChange={onChange}>
-      <T.List className="flex gap-1 overflow-x-auto border-b border-line" aria-label="Sections">
+      {/* overflow-y-hidden: the triggers' -mb-px would otherwise add a 1px vertical scrollbar. */}
+      <T.List className="flex gap-1 overflow-x-auto overflow-y-hidden border-b border-line" aria-label="Sections">
         {items.map((i) => (
           <T.Trigger
             key={i.value}

@@ -238,7 +238,7 @@ fn save(run: &mut Run, question: &str, page: &str, a: &Answer) {
 
 /// The pages it visited, as rows of the results index (new ones only).
 fn add_results(run: &Run, a: &Answer) {
-    let text = std::fs::read_to_string(run.dir.join("results.jsonl")).unwrap_or_default();
+    let text = crate::run::read_text(&run.dir.join("results.jsonl")).unwrap_or_default();
     let mut known = std::collections::HashSet::new();
     let mut rank = 0u64;
     for v in text.lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()) {

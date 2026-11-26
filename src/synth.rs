@@ -1,6 +1,11 @@
-//! AI synthesis of a run: a large-context model reads the run's pages and
-//! writes a cited answer (`synthesis.md`), and every quote it gives is
-//! checked word for word against the saved pages. The model is reached
+//! AI synthesis of a run: a large-context model reads a round's pages and
+//! writes a cited answer (`synthesis.rN.md`, the latest also as
+//! `synthesis.md`), and every quote it gives is checked word for word
+//! against the saved pages. A follow-up round is answered from its own
+//! pages, with the earlier rounds' answers as background; `--all` reads
+//! every round. What was sent, the raw answer and the figures are kept
+//! beside it (`synthesis.rN.request.json`, `.response.json`, `.json`).
+//! The model is reached
 //! over an Anthropic-style (`/v1/messages`) or OpenAI-style
 //! (`/v1/chat/completions`) endpoint (`synth.api`); the prompt is built in,
 //! or a text file read at run time (`synth.prompt`).
@@ -17,6 +22,36 @@ const OUT: &str = "synthesis.md";
 pub const RUNNING: &str = "synthesis.running";
 /// Some endpoints refuse a text block over 1 MiB.
 const BLOCK_BYTES: usize = 900_000;
+
+/// The part of a run a synthesis reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    Round(usize),
+    All,
+}
+
+impl Scope {
+    fn tag(self) -> String {
+        match self {
+            Scope::Round(n) => format!("r{n}"),
+            Scope::All => "all".into(),
+        }
+    }
+    fn file(self) -> String {
+        format!("synthesis.{}.md", self.tag())
+    }
+    fn label(self) -> String {
+        match self {
+            Scope::Round(n) => format!("round {n}"),
+            Scope::All => "all rounds".into(),
+        }
+    }
+}
+
+/// The newest round with a request file.
+pub fn latest_round(dir: &Path) -> usize {
+    (1..1000).take_while(|n| dir.join(format!("request.r{n}.json")).exists()).last().unwrap_or(1)
+}
 
 /// Synthesis needs an endpoint and a model; without them it is off.
 pub fn configured() -> bool {
@@ -47,27 +82,61 @@ pub fn wanted(req: &Request, planned: &[Planned]) -> bool {
     }
 }
 
-/// After a run: the synthesis, waited for, or started in its own process.
-pub async fn after_run(app: &Arc<AppContext>, run: &Run, _req: &Request) -> String {
-    // No pages (`--fetch 0`): nothing to synthesize, and nothing to report.
-    if !run.pages().iter().any(|p| p.ok) && !crate::finish::is_running(&run.dir) {
-        return String::new();
+/// What a run prints about its synthesis: a status line (and the short
+/// answer when it is ready) for the top of the summary, the rest for its end.
+#[derive(Default)]
+pub struct Printed {
+    pub top: String,
+    pub tail: String,
+}
+
+/// The status line for a run that asked for a synthesis that is not set up.
+pub fn not_set_up(req: &Request) -> Option<String> {
+    (req.synth == Some(true) && !configured())
+        .then(|| "synthesis: not set up, so none was written (set synth.url and synth.model; see config.example.toml)\n".to_string())
+}
+
+/// After a round: its synthesis, waited for, or started in its own process.
+pub async fn after_run(app: &Arc<AppContext>, run: &Run, _req: &Request) -> Printed {
+    // No pages this round (`--fetch 0`): nothing to synthesize, nothing to report.
+    if !run.pages().iter().any(|p| p.ok && p.round == run.round) && !crate::finish::is_running(&run.dir) {
+        return Printed::default();
     }
     let s = &crate::config::get().synth;
     if s.wait == "background" {
         return match spawn(&run.id) {
-            Ok(()) => format!(
-                "\n## AI synthesis\n\nRunning in the background ({}). Start `osearch wait {}` as a background command to be told when it is ready.\n",
-                s.model, run.id
-            ),
-            Err(e) => format!("\n## AI synthesis\n\nNot started: {e}. Run it with `osearch synth {}`.\n", run.id),
+            Ok(()) => Printed {
+                top: format!(
+                    "synthesis: running in the background ({}); start `osearch wait {}` as a background command to be told when it is ready\n",
+                    s.model, run.id
+                ),
+                tail: format!(
+                    "\n## AI synthesis\n\nRunning in the background ({}). Start `osearch wait {}` as a background command to be told when it is ready.\n",
+                    s.model, run.id
+                ),
+            },
+            Err(e) => Printed {
+                top: format!("synthesis: not started ({e}); `osearch synth {}` runs it\n", run.id),
+                tail: format!("\n## AI synthesis\n\nNot started: {e}. Run it with `osearch synth {}`.\n", run.id),
+            },
         };
     }
-    render(&synthesize(app, &run.dir).await, &run.id)
+    render(&synthesize(app, &run.dir, Scope::Round(run.round)).await, &run.id)
 }
 
-/// `osearch synth [RUN] [--wait]`.
-pub async fn command(app: Arc<AppContext>, which: Option<String>, wait: bool) -> Result<i32, crate::errors::SearchError> {
+/// A synthesis of this run is under way (a marker younger than the longest
+/// one could take; an older marker is left from a crash).
+fn running(dir: &Path) -> bool {
+    let limit = Duration::from_secs(crate::config::get().synth.timeout + 180);
+    std::fs::metadata(dir.join(RUNNING))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age < limit)
+}
+
+/// `osearch synth [RUN] [--wait] [--all]`.
+pub async fn command(app: Arc<AppContext>, which: Option<String>, wait: bool, all: bool) -> Result<i32, crate::errors::SearchError> {
     if !configured() {
         return Err(crate::errors::SearchError::Config(
             "synthesis is not set up: set synth.url and synth.model (and synth.api, synth.key) in the config; see config.example.toml".into(),
@@ -75,6 +144,7 @@ pub async fn command(app: Arc<AppContext>, which: Option<String>, wait: bool) ->
     }
     let dir = crate::run::resolve(which.as_deref().unwrap_or("last"))?;
     let id = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let scope = if all { Scope::All } else { Scope::Round(latest_round(&dir)) };
     if wait {
         let limit = Duration::from_secs(crate::config::get().synth.timeout + 30);
         let started = Instant::now();
@@ -87,14 +157,22 @@ pub async fn command(app: Arc<AppContext>, which: Option<String>, wait: bool) ->
             return Ok(0);
         }
     } else {
-        // Run in the background: let the run's background pages land first.
+        if running(&dir) {
+            return Err(crate::errors::SearchError::InvalidInput {
+                message: format!("a synthesis of {id} is already running; `osearch synth {id} --wait` prints it when it is done"),
+            });
+        }
+        // Marked now, so a second start while pages land is refused.
+        let _ = std::fs::write(dir.join(RUNNING), chrono::Local::now().to_rfc3339());
+        // Let the run's background pages land first.
         let started = Instant::now();
         while crate::finish::is_running(&dir) && started.elapsed() < Duration::from_secs(120) {
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
     }
-    let r = synthesize(&app, &dir).await;
-    print!("run {id}\n{}", render(&r, &id));
+    let r = synthesize(&app, &dir, scope).await;
+    let p = render(&r, &id);
+    print!("run {id}\n{}{}", p.top, p.tail);
     Ok(if r.is_ok() { 0 } else { 1 })
 }
 
@@ -149,6 +227,9 @@ pub(crate) fn spawn_self(args: &[&str]) -> Result<(), String> {
 }
 
 struct Done {
+    scope: Scope,
+    /// Earlier rounds given as their own syntheses.
+    earlier: usize,
     /// Micro-USD; None when no price is known for the model.
     cost: Option<u64>,
     /// The cost is osearch's own price-list estimate, not the endpoint's figure.
@@ -169,23 +250,36 @@ struct Done {
     pages_left: usize,
 }
 
-fn render(r: &Result<Done, String>, id: &str) -> String {
+/// The short answer goes at the top of the output (agents often read only
+/// the start); the end keeps the full text, or a pointer when `synth.show`
+/// asks for the short answer only.
+fn render(r: &Result<Done, String>, id: &str) -> Printed {
     match r {
         Ok(d) => {
             let s = &crate::config::get().synth;
+            let file = d.scope.file();
+            let mut top = format!("synthesis: ready ({}) · the full text is at the end and in {file}\n", d.scope.label());
+            if let Some(short) = &d.short {
+                top.push_str(&format!("\n## Answer (short, from the synthesis)\n\n{short}\n"));
+            }
             let body = match (s.show.as_str(), &d.short) {
-                ("short", Some(short)) => short.clone(),
-                ("both", Some(short)) => format!("{short}\n\n---\n\n{}", d.full),
+                ("short", Some(_)) => format!("The short answer is at the top of this output; the full text is in {file}."),
                 _ => d.full.clone(),
             };
-            format!("\n{}\n\n{body}\n", header(d, &s.model))
+            Printed { top, tail: format!("\n{}\n\n{body}\n", header(d, &s.model)) }
         }
-        Err(e) => format!("\n## AI synthesis\n\nSynthesis failed: {e}. Run `osearch synth {id}` to try again.\n"),
+        Err(e) => Printed {
+            top: format!("synthesis: failed ({e}); `osearch synth {id}` tries again\n"),
+            tail: format!("\n## AI synthesis\n\nSynthesis failed: {e}. Run `osearch synth {id}` to try again.\n"),
+        },
     }
 }
 
 fn header(d: &Done, model: &str) -> String {
     let mut left = String::new();
+    if d.earlier > 0 {
+        left.push_str(&format!(", {} earlier round(s) as their syntheses", d.earlier));
+    }
     if d.pages_cut > 0 {
         left.push_str(&format!(", {} as excerpts", d.pages_cut));
     }
@@ -201,14 +295,16 @@ fn header(d: &Done, model: &str) -> String {
         (Some(c), true) => format!("~${:.4} estimated", c as f64 / 1e6),
     };
     format!(
-        "## AI synthesis ({model}, {} s, {} pages read{left}, {}k tokens in, {}k out, {cost}; quotes: {} of {} found in the pages{}; full text: {OUT})",
+        "## AI synthesis ({}; {model}, {} s, {} pages read{left}, {}k tokens in, {}k out, {cost}; quotes: {} of {} found in the pages{}; full text: {})",
+        d.scope.label(),
         d.secs,
         d.pages_sent,
         d.tokens_in / 1000,
         d.tokens_out / 1000,
         d.found,
         d.quotes,
-        if d.bad_cites > 0 { format!(", {} citations to missing sections", d.bad_cites) } else { String::new() }
+        if d.bad_cites > 0 { format!(", {} citations to missing sections", d.bad_cites) } else { String::new() },
+        d.scope.file()
     )
 }
 
@@ -248,7 +344,7 @@ fn between(text: &str, tag: &str) -> Option<String> {
     Some(text[a..b].trim().to_string())
 }
 
-/// The prompt file: `synth.prompt`, else the repo copy, else the copy built in.
+/// The prompt: the file `synth.prompt` names, else the copy built in.
 fn prompt_text() -> String {
     let configured = crate::config::get().synth.prompt.clone();
     let builtin = include_str!("../prompts/synth.md");
@@ -264,20 +360,37 @@ fn prompt_text() -> String {
     }
 }
 
-/// The question and the run's searches, from its request files.
-fn question(dir: &Path) -> (String, Vec<String>) {
-    let mut topic = String::new();
-    let mut queries = Vec::new();
-    for round in 1..50 {
-        let Ok(t) = std::fs::read_to_string(dir.join(format!("request.r{round}.json"))) else { break };
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) else { continue };
-        if topic.is_empty() {
-            topic = v["topic"].as_str().unwrap_or("").to_string();
+/// A round's topic and searches, from its request file.
+fn round_request(dir: &Path, round: usize) -> Option<(String, Vec<String>)> {
+    let t = std::fs::read_to_string(dir.join(format!("request.r{round}.json"))).ok()?;
+    let v = serde_json::from_str::<serde_json::Value>(&t).ok()?;
+    let mut queries: Vec<String> = Vec::new();
+    for q in v["queries"].as_array().into_iter().flatten() {
+        let text = q.as_str().or_else(|| q["q"].as_str()).unwrap_or("").to_string();
+        if !text.is_empty() && !queries.contains(&text) {
+            queries.push(text);
         }
-        for q in v["queries"].as_array().into_iter().flatten() {
-            let text = q.as_str().or_else(|| q["q"].as_str()).unwrap_or("").to_string();
-            if !text.is_empty() && !queries.contains(&text) {
-                queries.push(text);
+    }
+    Some((v["topic"].as_str().unwrap_or("").trim().to_string(), queries))
+}
+
+/// The question and the searches: one round's (its own topic, else its
+/// first search), or the whole run's (round 1's topic, every search).
+fn question(dir: &Path, scope: Scope) -> (String, Vec<String>) {
+    let rounds: Vec<usize> = match scope {
+        Scope::Round(n) => vec![n],
+        Scope::All => (1..=latest_round(dir)).collect(),
+    };
+    let mut topic = String::new();
+    let mut queries: Vec<String> = Vec::new();
+    for r in rounds {
+        let Some((t, qs)) = round_request(dir, r) else { continue };
+        if topic.is_empty() {
+            topic = t;
+        }
+        for q in qs {
+            if !queries.contains(&q) {
+                queries.push(q);
             }
         }
     }
@@ -285,6 +398,38 @@ fn question(dir: &Path) -> (String, Vec<String>) {
         topic = queries.first().cloned().unwrap_or_default();
     }
     (topic, queries)
+}
+
+/// Earlier rounds of a run as background for round `n`: what each asked and
+/// the short answer of its own synthesis. Returns the block and the count.
+fn earlier_rounds(dir: &Path, n: usize) -> (String, usize) {
+    let tag = &crate::config::get().synth.shorttag;
+    let mut out = String::new();
+    let mut count = 0;
+    for r in 1..n {
+        let Some((topic, queries)) = round_request(dir, r) else { continue };
+        if queries.is_empty() {
+            continue;
+        }
+        let answer = std::fs::read_to_string(dir.join(Scope::Round(r).file()))
+            .ok()
+            .and_then(|t| between(&t, tag))
+            .map(|a| strip_marks(&a))
+            .unwrap_or_else(|| "(no synthesis was saved for this round)".into());
+        let asked = if topic.is_empty() { queries[0].clone() } else { topic };
+        out.push_str(&format!("Round {r} asked: {asked}\nIts searches: {}\nIts synthesis said:\n{answer}\n\n", queries.join(" | ")));
+        count += 1;
+    }
+    (out, count)
+}
+
+/// An earlier answer without its quote-check marks and citations, which
+/// point at pages this synthesis is not given.
+fn strip_marks(text: &str) -> String {
+    static MARKS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r" ?\[(verified|not found in [^\]]*|no such section)\]| ?\[p\d+#\d+\]").expect("regex")
+    });
+    MARKS.replace_all(text, "").into_owned()
 }
 
 /// A page with `[p3#4]` marking where each section begins.
@@ -304,13 +449,13 @@ fn marked(id: &str, md: &str, secs: &[crate::outline::Section]) -> String {
     out
 }
 
-/// The `## Engine answers` parts of every round's summary (`summary.rN.md`;
+/// The `## Engine answers` parts of the rounds' summaries (`summary.rN.md`;
 /// `summary.md` only holds the latest round).
-fn engine_answers(dir: &Path) -> String {
-    let mut files: Vec<String> = (1..100)
-        .map(|n| format!("summary.r{n}.md"))
-        .take_while(|f| dir.join(f).exists())
-        .collect();
+fn engine_answers(dir: &Path, scope: Scope) -> String {
+    let mut files: Vec<String> = match scope {
+        Scope::Round(n) => vec![format!("summary.r{n}.md")].into_iter().filter(|f| dir.join(f).exists()).collect(),
+        Scope::All => (1..100).map(|n| format!("summary.r{n}.md")).take_while(|f| dir.join(f).exists()).collect(),
+    };
     if files.is_empty() {
         files.push("summary.md".into());
     }
@@ -332,13 +477,19 @@ fn engine_answers(dir: &Path) -> String {
 /// Results with no fetched page (never picked, or picked and not fetched):
 /// title, address and every engine's snippet, `research.snippetprefer`
 /// engines first.
-fn other_results(dir: &Path, n: usize) -> String {
+fn other_results(dir: &Path, n: usize, scope: Scope) -> String {
     let read: std::collections::HashSet<String> =
         crate::run::load_pages(dir).into_iter().filter(|p| p.ok).map(|p| p.id).collect();
     let prefer = &crate::config::get().research.snippetprefer;
-    let text = std::fs::read_to_string(dir.join("results.jsonl")).unwrap_or_default();
-    text.lines()
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+    let text = crate::run::read_text(&dir.join("results.jsonl")).unwrap_or_default();
+    let rows: Vec<serde_json::Value> = text.lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok()).collect();
+    // Runs from before rows carried their round are read whole.
+    let tagged = rows.iter().any(|r| r["round"].as_u64().is_some());
+    rows.into_iter()
+        .filter(|r| match scope {
+            Scope::Round(k) if tagged => r["round"].as_u64() == Some(k as u64),
+            _ => true,
+        })
         .filter(|r| r["page"].as_str().is_none_or(|id| !read.contains(id)))
         .take(n)
         .map(|r| {
@@ -433,11 +584,22 @@ fn excerpt(id: &str, md: &str, secs: &[crate::outline::Section], terms: &[String
 /// `maxinput` tokens every page goes whole (each up to `pagecap`); over it,
 /// top pages whole and the rest as their best sections, so every page is
 /// represented; pages left out only when even that does not fit.
-fn material(dir: &Path, pages: &[PageEntry], terms: &[String]) -> (Vec<String>, usize, usize, usize) {
+struct Material {
+    blocks: Vec<String>,
+    /// Per page: how it was sent (whole, excerpt, left out) and its tokens.
+    sent_as: Vec<serde_json::Value>,
+    sent: usize,
+    cut: usize,
+    left: usize,
+}
+
+fn material(dir: &Path, pages: &[PageEntry], terms: &[String], scope: Scope) -> Material {
     use crate::outline::tokens;
     let s = &crate::config::get().synth;
     const SHORT: usize = 4_000;
     struct Piece {
+        id: String,
+        round: usize,
         head: String,
         whole: String,
         whole_tok: usize,
@@ -465,25 +627,36 @@ fn material(dir: &Path, pages: &[PageEntry], terms: &[String]) -> (Vec<String>, 
             p.tier,
             p.fetcher
         );
-        pieces.push(Piece { head, whole_tok: tokens(&whole), whole, short_tok: tokens(&short), short });
+        pieces.push(Piece {
+            id: p.id.clone(),
+            round: p.round,
+            head,
+            whole_tok: tokens(&whole),
+            whole,
+            short_tok: tokens(&short),
+            short,
+        });
     }
     let mut blocks = Vec::new();
+    let mut sent_as = Vec::new();
     let (mut sent, mut cut, mut left) = (0, 0, 0);
     let mut used = 0usize;
     for i in 0..pieces.len() {
         let rest: usize = pieces[i + 1..].iter().map(|p| p.short_tok).sum();
         let p = &pieces[i];
-        let body = if used + p.whole_tok + rest <= s.maxinput {
+        let (body, how, tok) = if used + p.whole_tok + rest <= s.maxinput {
             used += p.whole_tok;
-            &p.whole
+            (&p.whole, "whole", p.whole_tok)
         } else if used + p.short_tok <= s.maxinput {
             used += p.short_tok;
             cut += 1;
-            &p.short
+            (&p.short, "excerpt", p.short_tok)
         } else {
             left += 1;
+            sent_as.push(serde_json::json!({ "id": p.id, "round": p.round, "sent": "left out", "tokens": 0 }));
             continue;
         };
+        sent_as.push(serde_json::json!({ "id": p.id, "round": p.round, "sent": how, "tokens": tok }));
         sent += 1;
         let block = format!("{}{body}\n</page>", p.head);
         // One block per page, split where a page passes the block limit.
@@ -499,25 +672,25 @@ fn material(dir: &Path, pages: &[PageEntry], terms: &[String]) -> (Vec<String>, 
         blocks.push(rest.to_string());
     }
     if s.answers {
-        let a = engine_answers(dir);
+        let a = engine_answers(dir, scope);
         if !a.is_empty() {
             blocks.push(format!("<engine_answers>\n{a}\n</engine_answers>"));
         }
     }
     if s.snippets {
-        let o = other_results(dir, 80);
+        let o = other_results(dir, 80, scope);
         if !o.is_empty() {
             blocks.push(format!("<other_results>\n{o}\n</other_results>"));
         }
     }
-    (blocks, sent, cut, left)
+    Material { blocks, sent_as, sent, cut, left }
 }
 
-async fn synthesize(_app: &Arc<AppContext>, dir: &Path) -> Result<Done, String> {
+async fn synthesize(_app: &Arc<AppContext>, dir: &Path, scope: Scope) -> Result<Done, String> {
     let _ = std::fs::write(dir.join(RUNNING), chrono::Local::now().to_rfc3339());
     // Its own task, so a bug in it fails the synthesis, not the run.
     let d = dir.to_path_buf();
-    let r = match tokio::spawn(async move { synthesize_inner(&d).await }).await {
+    let r = match tokio::spawn(async move { synthesize_inner(&d, scope).await }).await {
         Ok(r) => r,
         Err(e) if e.is_panic() => Err("an internal error in osearch (a bug; the run's pages are fine)".into()),
         Err(e) => Err(e.to_string()),
@@ -540,18 +713,42 @@ fn client() -> &'static reqwest::Client {
     })
 }
 
-async fn synthesize_inner(dir: &Path) -> Result<Done, String> {
+async fn synthesize_inner(dir: &Path, scope: Scope) -> Result<Done, String> {
     let s = crate::config::get().synth.clone();
     let rc = &crate::config::get().research;
     let near_copy = |p: &PageEntry| rc.dedupe && p.same_as.is_some() && u64::from(p.overlap.unwrap_or(0)) >= rc.dedupemin;
-    let mut pages: Vec<PageEntry> = crate::run::load_pages(dir).into_iter().filter(|p| p.ok && !near_copy(p)).collect();
+    let in_scope = |p: &PageEntry| match scope {
+        Scope::Round(n) => p.round == n,
+        Scope::All => true,
+    };
+    let mut pages: Vec<PageEntry> = crate::run::load_pages(dir).into_iter().filter(|p| p.ok && !near_copy(p) && in_scope(p)).collect();
     pages.sort_by_key(|p| page_number(&p.id));
     if pages.is_empty() {
-        return Err("the run has no fetched pages to read".into());
+        return Err(match scope {
+            Scope::Round(n) => format!("round {n} has no fetched pages to read (`--all` reads every round)"),
+            Scope::All => "the run has no fetched pages to read".into(),
+        });
     }
-    let (q, queries) = question(dir);
+    let (q, queries) = question(dir, scope);
     let terms = crate::outline::terms(&queries.join(" "));
-    let (mut blocks, sent, cut, left) = material(dir, &pages, &terms);
+    let Material { mut blocks, sent_as, sent, cut, left } = material(dir, &pages, &terms, scope);
+    let (earlier, earlier_n) = match scope {
+        Scope::Round(n) if n > 1 => earlier_rounds(dir, n),
+        _ => (String::new(), 0),
+    };
+    if let Scope::Round(n) = scope {
+        if earlier_n > 0 {
+            blocks.insert(
+                0,
+                format!(
+                    "This is round {n} of a research run. Answer this round's question from this round's pages below. \
+                     The earlier rounds' questions and answers are in <earlier_rounds> as background: use them to connect \
+                     findings and avoid repeating what is already known, and cite only this round's pages."
+                ),
+            );
+            blocks.push(format!("<earlier_rounds>\n{}</earlier_rounds>", earlier));
+        }
+    }
     blocks.push(format!("The question again: {q}"));
     let system = prompt_text()
         .replace("{{date}}", &chrono::Local::now().format("%Y-%m-%d").to_string())
@@ -591,6 +788,9 @@ async fn synthesize_inner(dir: &Path) -> Result<Done, String> {
         }
     }
     let run_id = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let tag = scope.tag();
+    // What is sent is kept beside the answer (the key travels in a header, never here).
+    let _ = std::fs::write(dir.join(format!("synthesis.{tag}.request.json")), serde_json::to_string(&body).unwrap_or_default());
     let started = Instant::now();
     // One session id and one body for every attempt: a proxy that keeps
     // sessions (the x-session-id header) can treat an
@@ -598,47 +798,16 @@ async fn synthesize_inner(dir: &Path) -> Result<Done, String> {
     // dropped one and hands back the same answer, billed once.
     let session = format!("osearch-synth-{run_id}-{}", chrono::Utc::now().timestamp());
     let deadline = started + Duration::from_secs(s.timeout);
-    let mut attempts = 0;
-    let (status, text) = loop {
-        attempts += 1;
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Err(format!("no answer within {} s ({attempts} attempts)", s.timeout));
+    let (mut status, mut text) = post(&s, &body, &session, deadline, openai).await?;
+    // OpenAI's reasoning models refuse `max_tokens`; nothing was billed.
+    if openai && status.as_u16() == 400 && text.contains("max_tokens") {
+        if let Some(obj) = body.as_object_mut() {
+            let n = obj.remove("max_tokens").unwrap_or(serde_json::json!(s.maxtokens));
+            obj.insert("max_completion_tokens".into(), n);
         }
-        let mut request = client()
-            .post(&s.url)
-            .header("content-type", "application/json")
-            .header("x-session-id", &session)
-            .timeout(left)
-            .json(&body);
-        if !openai {
-            request = request.header("anthropic-version", "2023-06-01");
-        }
-        if !s.key.is_empty() {
-            request = if openai {
-                request.bearer_auth(&s.key)
-            } else {
-                request.header("x-api-key", &s.key)
-            };
-        }
-        let dropped = |e: &reqwest::Error| !e.is_connect() && !e.is_builder() && !e.is_status();
-        match request.send().await {
-            Ok(resp) => {
-                let status = resp.status();
-                match resp.text().await {
-                    Ok(t) => break (status, t),
-                    Err(e) if dropped(&e) && attempts < 6 => continue,
-                    Err(e) => return Err(format!("the answer was cut off ({})", e.without_url())),
-                }
-            }
-            Err(e) if e.is_connect() => {
-                return Err(format!("could not reach the synthesis endpoint at {} ({}); is it running?", s.url, e.without_url()))
-            }
-            Err(e) if e.is_timeout() => return Err(format!("no answer within {} s ({attempts} attempts)", s.timeout)),
-            Err(e) if dropped(&e) && attempts < 6 => continue,
-            Err(e) => return Err(format!("the connection to the synthesis endpoint failed ({})", e.without_url())),
-        }
-    };
+        (status, text) = post(&s, &body, &session, deadline, openai).await?;
+    }
+    let _ = std::fs::write(dir.join(format!("synthesis.{tag}.response.json")), &text);
     let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
     if !status.is_success() {
         let detail = v["error"]["message"].as_str().map(str::to_string).unwrap_or_else(|| crate::providers::thread::clip(&text, 200));
@@ -672,6 +841,8 @@ async fn synthesize_inner(dir: &Path) -> Result<Done, String> {
     let short = between(&checked, &s.shorttag);
     let full = between(&checked, &s.fulltag).unwrap_or_else(|| checked.clone());
     let done = Done {
+        scope,
+        earlier: earlier_n,
         cost,
         estimated,
         short,
@@ -687,9 +858,84 @@ async fn synthesize_inner(dir: &Path) -> Result<Done, String> {
         pages_pending: crate::finish::pending_in(dir).len(),
         pages_left: left,
     };
+    let manifest = serde_json::json!({
+        "scope": scope.label(),
+        "question": q,
+        "queries": queries,
+        "earlier_rounds": earlier_n,
+        "model": s.model,
+        "api": s.api,
+        "effort": s.effort,
+        "started": chrono::Local::now().to_rfc3339(),
+        "secs": secs,
+        "stop": reply.stop,
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
+        "tokens_cached": tokens_cached,
+        "cost_usd": cost.map(|c| c as f64 / 1e6),
+        "cost_estimated": estimated,
+        "quotes": quotes,
+        "quotes_found": found,
+        "bad_citations": bad_cites,
+        "pages": { "sent": sent, "as_excerpts": cut, "left_out": left, "still_fetching": done.pages_pending },
+        "sent_as": sent_as,
+    });
+    let _ = std::fs::write(dir.join(format!("synthesis.{tag}.json")), serde_json::to_string_pretty(&manifest).unwrap_or_default());
     let file = format!("{}\n\n{checked}\n", header(&done, &s.model));
+    std::fs::write(dir.join(scope.file()), &file).map_err(|e| e.to_string())?;
     std::fs::write(dir.join(OUT), file).map_err(|e| e.to_string())?;
     Ok(done)
+}
+
+/// One request to the synthesis endpoint, retried when the connection drops.
+async fn post(
+    s: &crate::config::Synth,
+    body: &serde_json::Value,
+    session: &str,
+    deadline: Instant,
+    openai: bool,
+) -> Result<(reqwest::StatusCode, String), String> {
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(format!("no answer within {} s ({attempts} attempts)", s.timeout));
+        }
+        let mut request = client()
+            .post(&s.url)
+            .header("content-type", "application/json")
+            .header("x-session-id", session)
+            .timeout(left)
+            .json(&body);
+        if !openai {
+            request = request.header("anthropic-version", "2023-06-01");
+        }
+        if !s.key.is_empty() {
+            request = if openai {
+                request.bearer_auth(&s.key)
+            } else {
+                request.header("x-api-key", &s.key)
+            };
+        }
+        let dropped = |e: &reqwest::Error| !e.is_connect() && !e.is_builder() && !e.is_status();
+        match request.send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                match resp.text().await {
+                    Ok(t) => return Ok((status, t)),
+                    Err(e) if dropped(&e) && attempts < 6 => continue,
+                    Err(e) => return Err(format!("the answer was cut off ({})", e.without_url())),
+                }
+            }
+            Err(e) if e.is_connect() => {
+                return Err(format!("could not reach the synthesis endpoint at {} ({}); is it running?", s.url, e.without_url()))
+            }
+            Err(e) if e.is_timeout() => return Err(format!("no answer within {} s ({attempts} attempts)", s.timeout)),
+            Err(e) if dropped(&e) && attempts < 6 => continue,
+            Err(e) => return Err(format!("the connection to the synthesis endpoint failed ({})", e.without_url())),
+        }
+    }
 }
 
 /// The answer text, stop reason and token counts of either API style.
@@ -859,15 +1105,17 @@ mod tests {
         d
     }
 
-    /// Re-synthesis after a follow-up round still sees the first round's engine answers.
+    /// A round's synthesis gets that round's engine answers; `--all` gets every round's.
     #[test]
-    fn engine_answers_come_from_every_round() {
+    fn engine_answers_follow_the_scope() {
         let d = dir("answers");
         std::fs::write(d.join("summary.r1.md"), "# r1\n\n## Engine answers (x)\n\n- q1 tavily: first\n\n## Pages\n").unwrap();
         std::fs::write(d.join("summary.r2.md"), "# r2\n\n## Engine answers (x)\n\n- q2 tavily: second\n").unwrap();
         std::fs::write(d.join("summary.md"), "# r2\n\n## Engine answers (x)\n\n- q2 tavily: second\n").unwrap();
-        let a = engine_answers(&d);
-        assert!(a.contains("first") && a.contains("second"), "{a}");
+        let all = engine_answers(&d, Scope::All);
+        assert!(all.contains("first") && all.contains("second"), "{all}");
+        let r2 = engine_answers(&d, Scope::Round(2));
+        assert!(r2.contains("second") && !r2.contains("first"), "{r2}");
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -886,7 +1134,7 @@ mod tests {
         };
         let rows = format!("{}{}{}", row("p1", ",\"page\":\"p1\""), row("p2", ",\"page\":\"p2\""), row("p3", ""));
         std::fs::write(d.join("results.jsonl"), rows).unwrap();
-        let out = other_results(&d, 80);
+        let out = other_results(&d, 80, Scope::All);
         assert!(!out.contains("e.com/p1"), "a fetched page is not repeated: {out}");
         assert!(out.contains("e.com/p2") && out.contains("e.com/p3"), "{out}");
         assert!(out.find("exa:").unwrap() < out.find("brave:").unwrap(), "preferred engine first: {out}");

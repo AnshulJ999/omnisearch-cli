@@ -1,10 +1,11 @@
 import { Background, Controls, Handle, MarkerType, Position, ReactFlow, type Edge, type Node, type NodeProps } from "@xyflow/react";
 import ELK from "elkjs/lib/elk.bundled.js";
-import { Archive, Cpu, GitBranch, Play, SquareStack, X } from "lucide-react";
+import { Archive, Cpu, GitBranch, Maximize2, Minimize2, Play, SquareStack, X } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router";
 import { Badge, Button, Card, ErrorBox, Loading, PageHeader, Tabs } from "@/components/ui";
 import { cn } from "@/lib/format";
+import { useDark } from "@/lib/theme";
 import type { ConfigAnswer, Setting } from "@/lib/types";
 import flowsData from "@/flows/flows.json";
 import { EditSetting, show, useConfig, valueOf } from "./Settings";
@@ -101,8 +102,15 @@ export default function HowPage() {
   const pos = useLayout(flow);
   const [sel, setSel] = useState<string | null>(null);
   const [editing, setEditing] = useState<Setting | null>(null);
+  const [big, setBig] = useState(false);
   useEffect(() => setSel(null), [flow.id]);
-  const dark = document.documentElement.classList.contains("dark");
+  useEffect(() => {
+    if (!big) return;
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setBig(false);
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [big]);
+  const dark = useDark();
 
   const nodes: Node<BoxData>[] = useMemo(
     () => (pos ? flow.nodes.map((n) => ({ id: n.id, type: "box", position: pos[n.id] ?? { x: 0, y: 0 }, data: { node: n, values: cfg.data?.values, selected: sel === n.id } })) : []),
@@ -126,23 +134,35 @@ export default function HowPage() {
 
   return (
     <>
-      <PageHeader title="How it works" sub="What osearch does, step by step, with the settings that steer each step at their current values. Click a box for details." />
+      <PageHeader title="How it works" sub="What osearch does, step by step, with the settings that steer each step at their current values. Click a box for details; scroll to move down the map, Ctrl+scroll or the buttons to zoom." />
       <Tabs value={flow.id} onChange={(v) => nav(`/how/${v}`)} items={FLOWS.map((f) => ({ value: f.id, label: f.title }))}>
         <p className="mt-3 text-sm text-muted">{flow.intro}</p>
       </Tabs>
       {cfg.isError && <ErrorBox error={cfg.error} />}
       <div className="mt-4 grid gap-4 lg:grid-cols-[minmax(0,1fr)_360px]">
-        <Card className="h-[72vh] min-h-[480px] overflow-hidden">
+        <Card className={cn("relative overflow-hidden", big ? "fixed inset-3 z-40 shadow-xl" : "h-[72vh] min-h-[480px]")}>
+          <Button
+            size="sm"
+            variant="ghost"
+            className="absolute right-2 top-2 z-10 bg-panel"
+            onClick={() => setBig(!big)}
+            aria-label={big ? "Shrink the map" : "Expand the map"}
+          >
+            {big ? <Minimize2 className="h-3.5 w-3.5" /> : <Maximize2 className="h-3.5 w-3.5" />} {big ? "Shrink" : "Expand"}
+          </Button>
           {!pos ? (
             <Loading what="the map" />
           ) : (
             <ReactFlow
-              key={flow.id}
+              key={`${flow.id}-${big}`}
               nodes={nodes}
               edges={edges}
               nodeTypes={nodeTypes}
               fitView
-              fitViewOptions={{ padding: 0.15 }}
+              fitViewOptions={{ nodes: flow.nodes.slice(0, 3).map((n) => ({ id: n.id })), maxZoom: 1, minZoom: 1, padding: 0.6 }}
+              panOnScroll
+              zoomOnScroll={false}
+              zoomOnPinch
               nodesDraggable={false}
               nodesConnectable={false}
               onNodeClick={(_, n) => setSel(n.id)}

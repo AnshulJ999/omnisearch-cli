@@ -42,6 +42,17 @@ EXE=osearch
 [ "$WINDOWS" = 1 ] && EXE=osearch.exe
 DEST="${OSEARCH_INSTALL_DIR:-}"
 if [ -n "$DEST" ] && [ -d "$DEST" ]; then
+  # On Windows a running osearch (the web UI, a background fetch) keeps its
+  # exe open: an open exe can be renamed but not replaced, so it moves aside.
+  # Copies left by an earlier install go first, unless still running.
+  if [ "$WINDOWS" = 1 ] && [ -f "$DEST/$EXE" ]; then
+    for old in "$DEST"/osearch.old*.exe; do
+      [ -e "$old" ] && rm -f "$old" 2>/dev/null
+    done
+    aside="$DEST/osearch.old.exe"
+    [ -e "$aside" ] && aside="$DEST/osearch.old.$(date +%s).exe"
+    mv "$DEST/$EXE" "$aside"
+  fi
   cp "target/release/$EXE" "$DEST/$EXE"
   echo "installed: $DEST/$EXE"
 else

@@ -1,17 +1,20 @@
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ArrowLeft, FolderOpen, RefreshCw, Sparkles } from "lucide-react";
+import { useEffect, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router";
 import { toast } from "sonner";
 import Markdown from "@/components/Markdown";
 import { Badge, Button, Card, Empty, ErrorBox, Hint, Loading, PageHeader, TabPanel, Tabs } from "@/components/ui";
-import { post } from "@/lib/api";
+import { get, post } from "@/lib/api";
 import { questionsOf, runTime, usd, when } from "@/lib/format";
+import type { Info, Job } from "@/lib/types";
 import { useRun } from "./data";
 import Overview from "./Overview";
 import PagesTab from "./PagesTab";
 import PageViewer from "./PageViewer";
 import ResultsTab from "./ResultsTab";
 import SearchesTab from "./SearchesTab";
+import SynthesisView from "./SynthesisView";
 import Timeline from "./Timeline";
 
 const TABS = [
@@ -30,14 +33,26 @@ export default function RunPage() {
   const [params, setParams] = useSearchParams();
   const run = useRun(id);
   const qc = useQueryClient();
+  const info = useQuery({ queryKey: ["info"], queryFn: () => get<Info>("/info") });
+  // The synthesis job is followed until it ends, so the button stays busy
+  // and a failure shows here, not only on the Search page.
+  const [jobId, setJobId] = useState<number | null>(null);
+  const job = useQuery({
+    queryKey: ["job", jobId],
+    queryFn: () => get<Job>(`/jobs/${jobId}`),
+    enabled: jobId !== null,
+    refetchInterval: (q) => (q.state.data?.ended ? false : 2000),
+  });
+  const ended = job.data?.ended ?? null;
+  useEffect(() => {
+    if (ended !== null) qc.invalidateQueries({ queryKey: ["run", id] });
+  }, [ended, id, qc]);
   const synth = useMutation({
-    mutationFn: () => post("/jobs", { kind: "synth", run: id }),
-    onSuccess: () => {
-      toast.success("Synthesis started; it shows here when it lands.");
-      setTimeout(() => qc.invalidateQueries({ queryKey: ["run", id] }), 2000);
-    },
+    mutationFn: () => post<{ id: number }>("/jobs", { kind: "synth", run: id }),
+    onSuccess: (j) => setJobId(j.id),
     onError: (e) => toast.error(String(e)),
   });
+  const failed = job.data?.ended && job.data.code !== 0 ? (job.data.lines ?? []).slice(-6) : null;
 
   if (run.isLoading) return <Loading what="the run" />;
   if (run.isError || !run.data) return <ErrorBox error={run.error ?? "no data"} onRetry={() => run.refetch()} />;
@@ -51,6 +66,19 @@ export default function RunPage() {
   });
   const [pageId, sec] = (params.get("page") ?? "").split("#");
   const page = r.pages.find((p) => p.id === pageId && (p.ok || !r.pages.some((q) => q.id === pageId && q.ok)));
+  const writing = synth.isPending || (jobId !== null && !job.data?.ended) || r.synthesis_running;
+  const latest = r.rounds.length;
+  const writeButton = (variant: "primary" | "ghost") => (
+    <Button variant={variant} size={variant === "ghost" ? "sm" : undefined} busy={writing} onClick={() => synth.mutate()}>
+      {writing ? "Writing…" : variant === "primary" ? "Write a synthesis" : latest > 1 ? `Write again for round ${latest}` : "Write again"}
+    </Button>
+  );
+  const failure = failed && (
+    <div className="mb-4 rounded-md bg-bad-soft px-3 py-2 text-sm text-bad">
+      <p className="font-medium">The synthesis failed.</p>
+      <pre className="mt-1 whitespace-pre-wrap font-mono text-xs">{failed.join("\n")}</pre>
+    </div>
+  );
 
   return (
     <>
@@ -101,16 +129,23 @@ export default function RunPage() {
         </TabPanel>
         <TabPanel value="synthesis">
           <Card className="p-5">
-            {r.synthesis_running ? (
+            {failure}
+            {writing && !r.synthesis_running && jobId !== null ? (
+              <Empty title="Getting ready to write">It waits for pages still fetching, then writes. This page checks again every few seconds.</Empty>
+            ) : r.synthesis_running ? (
               <Empty title="The synthesis is still being written">This page checks again every few seconds.</Empty>
-            ) : r.synthesis ? (
-              <Markdown text={r.synthesis} onCite={openPage} />
+            ) : r.synthesis || (r.syntheses?.length ?? 0) > 0 ? (
+              <SynthesisView run={r} openPage={openPage} top={info.data?.synth_configured && <div className="flex justify-end">{writeButton("ghost")}</div>} />
+            ) : info.data && !info.data.synth_configured ? (
+              <Empty title="Synthesis isn't set up" icon={<Sparkles className="h-6 w-6" />}>
+                <p>
+                  Set an endpoint and a model in <Link to="/settings" className="text-accent hover:underline">Settings</Link> (synth.url and synth.model) to have a model write a cited answer from the pages.
+                </p>
+              </Empty>
             ) : (
               <Empty title="This run has no synthesis" icon={<Sparkles className="h-6 w-6" />}>
-                <p>A model can read the run's pages and write a cited answer. It costs a few cents on the configured endpoint.</p>
-                <Button className="mt-3" variant="primary" busy={synth.isPending} onClick={() => synth.mutate()}>
-                  Write a synthesis
-                </Button>
+                <p>A model can read the latest round's pages and write a cited answer. It costs a few cents on the configured endpoint.</p>
+                <div className="mt-3">{writeButton("primary")}</div>
               </Empty>
             )}
           </Card>

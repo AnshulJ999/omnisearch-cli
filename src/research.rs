@@ -263,6 +263,8 @@ struct UrlRow {
     found_by: Vec<Sighting>,
     #[serde(skip_serializing_if = "Option::is_none")]
     page: Option<String>,
+    /// The round whose searches found it.
+    round: usize,
 }
 
 const SEMANTIC: &[&str] = &["exa", "youcom", "parallel", "linkup"];
@@ -524,14 +526,25 @@ pub async fn run(app: Arc<AppContext>, req: Request) -> Result<Outcome, crate::e
     } else {
         req.topic.clone()
     };
+    // A fetch of known pages into an earlier run joins that run's latest
+    // round; searches open a new round.
+    let attach = req.queries.is_empty() && req.parent.is_some();
     let mut run = match req.parent.as_deref() {
+        Some(p) if attach => Run::attach(p)?,
         Some(p) => Run::follow(p)?,
         None => Run::create(&topic)?,
     };
-    run.write_json(&format!("request.r{}.json", run.round), &req)?;
+    if attach {
+        run.append_jsonl("fetches.jsonl", &serde_json::json!({ "round": run.round, "ts": raw::now(), "urls": req.urls }));
+    } else {
+        run.write_json(&format!("request.r{}.json", run.round), &req)?;
+    }
+    // The run id first, on stderr (stdout may be JSON): a reader that cuts
+    // the output short, or a page following the job, still has it.
+    eprintln!("run {} (round {}) · {}", run.id, run.round, run.dir.display());
     // Replaced by the real summary when the run finishes; a run that is
     // killed keeps this note, its request and every engine answer so far.
-    if run.round == 1 {
+    if run.round == 1 && !attach {
         let note = format!(
             "# OmniSearch run {id} (unfinished: stopped early or still running)\n\nfolder: {dir}\n\n\
              This run did not finish. Engine answers that arrived are in raw/; the request is request.r1.json.\n\
@@ -662,247 +675,22 @@ pub async fn run(app: Arc<AppContext>, req: Request) -> Result<Outcome, crate::e
             crate::rounds::github::keep_matches(resp, &parent.query);
         }
     }
-    // The rounds, at once, on what the first searches found.
-    let (reddit, forums, github, alternatives, telegram) = tokio::join!(
-        crate::rounds::reddit::round(&app, &recorder, &planned, &responses, &req, no_cache),
+    // The other rounds, at once, on what the first searches found. Reddit's
+    // round comes below: on a community run it runs beside the first pages.
+    let (forums, github, alternatives, telegram) = tokio::join!(
         crate::rounds::forums::round(&app, &recorder, &planned, &responses, no_cache),
         crate::rounds::github::round(&app, &recorder, &planned, &responses, &req, no_cache),
         crate::rounds::alternatives::round(&app, &recorder, &planned, &responses, no_cache),
         crate::rounds::telegram::round(&app, &recorder, &planned, &responses),
     );
-    let mut rounds = reddit;
-    rounds.merge(forums);
+    let mut rounds = forums;
     rounds.merge(github);
     rounds.merge(alternatives);
     rounds.merge(telegram);
     planned.extend(rounds.planned);
     responses.extend(rounds.responses);
     warnings.extend(rounds.notes);
-    let round_coverage = rounds.coverage;
-    crate::rounds::forums::learn(&planned, &responses);
-
-    // The results index: every URL with every engine's sighting.
-    let calls = recorder.calls();
-    let raw_for = |label: &str, engine: &str| -> Option<String> {
-        calls
-            .iter()
-            .filter(|c| c.label == label && c.provider.eq_ignore_ascii_case(engine))
-            .last()
-            .map(|c| c.raw.clone())
-    };
-    let mut rows: HashMap<String, UrlRow> = HashMap::new();
-    let mut order: Vec<String> = Vec::new();
-    let mut answers: Vec<(String, String, String)> = Vec::new();
-    let mut failures: Vec<String> = Vec::new();
-    let mut cost_micros = 0u64;
-    // One line per search (what it asked, found and from whom), then the
-    // community and found-by-one-engine lines in `coverage`.
-    let mut searches: Vec<String> = Vec::new();
-    let mut coverage: Vec<String> = round_coverage;
-    let mut seen_urls: HashSet<String> = run
-        .pages()
-        .iter()
-        .map(|p| normalize_url(&p.url))
-        .collect();
-    let mut engine_urls: BTreeMap<String, HashSet<String>> = BTreeMap::new();
-    for p in &planned {
-        let Some(r) = responses.get(&p.label) else {
-            searches.push(format!(
-                "{} [{}] {}: no answer recorded",
-                p.label,
-                p.mode,
-                crate::providers::thread::clip(&p.query, 120)
-            ));
-            continue;
-        };
-        match r {
-            Ok(resp) => {
-                cost_micros += resp.metadata.cost.as_ref().map_or(0, |c| c.micros);
-                for f in &resp.metadata.provider_failures {
-                    failures.push(format!("{} {}: [{}] {}", p.label, f.provider, f.category.as_str(), crate::providers::thread::clip(&f.reason, 200)));
-                }
-                for w in &resp.metadata.warnings {
-                    warnings.push(format!("{}: {w}", p.label));
-                }
-                for a in &resp.answers {
-                    answers.push((p.label.clone(), a.provider.clone(), a.text.clone()));
-                }
-                let buckets: Vec<(String, Vec<crate::types::SearchResult>)> =
-                    if resp.per_provider.is_empty() {
-                        replay_buckets(&resp.results)
-                    } else {
-                        resp.per_provider.clone()
-                    };
-                let mut new_here = 0;
-                let mut total_here = HashSet::new();
-                for (engine, items) in buckets {
-                    // Serper sometimes answers with Google redirect links in place
-                    // of the real addresses: they cannot be matched or read.
-                    let redirects = items.iter().filter(|it| it.url.contains("google.com/url?")).count();
-                    if redirects > 0 {
-                        warnings.push(format!(
-                            "{} {engine}: {redirects} of {} results are Google redirect links, not page addresses; they cannot be matched with other engines' results or read",
-                            p.label,
-                            items.len()
-                        ));
-                    }
-                    // Reddit refused its own search and a web search of reddit.com
-                    // answered in its place: that one cannot apply a date limit.
-                    if engine == "reddit"
-                        && p.opts.freshness.is_some()
-                        && items.iter().any(|it| it.extra.as_ref().is_some_and(|e| e["route"] == "web"))
-                    {
-                        warnings.push(format!(
-                            "{}: Reddit refused its own search; the web search used in its place does not apply -f, so its threads can be older (each page shows its own date)",
-                            p.label
-                        ));
-                    }
-                    for (i, it) in items.iter().enumerate() {
-                        if it.url.is_empty() {
-                            continue;
-                        }
-                        let key = normalize_url(&it.url);
-                        total_here.insert(key.clone());
-                        engine_urls.entry(engine.clone()).or_default().insert(key.clone());
-                        if seen_urls.insert(key.clone()) {
-                            new_here += 1;
-                        }
-                        let row = rows.entry(key.clone()).or_insert_with(|| {
-                            order.push(key.clone());
-                            UrlRow {
-                                rank: 0,
-                                url: it.url.clone(),
-                                title: it.title.clone(),
-                                score: 0.0,
-                                engines: Vec::new(),
-                                queries: Vec::new(),
-                                found_by: Vec::new(),
-                                page: None,
-                            }
-                        });
-                        row.score += 1.0 / (60.0 + i as f64 + 1.0);
-                        if !row.engines.contains(&engine) {
-                            row.engines.push(engine.clone());
-                        }
-                        if !row.queries.contains(&p.label) {
-                            row.queries.push(p.label.clone());
-                        }
-                        if row.title.is_empty() {
-                            row.title = it.title.clone();
-                        }
-                        row.found_by.push(Sighting {
-                            q: p.label.clone(),
-                            engine: engine.clone(),
-                            rank: i + 1,
-                            title: it.title.clone(),
-                            snippet: it.snippet.clone(),
-                            published: it.published.clone(),
-                            raw: raw_for(&p.label, &engine),
-                            web: engine == "reddit" && it.extra.as_ref().is_some_and(|e| e["route"] == "web"),
-                        });
-                    }
-                }
-                let by_engine: Vec<String> = resp
-                    .metadata
-                    .provider_results
-                    .iter()
-                    .map(|(e, n)| format!("{e} {n}"))
-                    .collect();
-                let engines_txt = if by_engine.is_empty() { p.engines_used.join(", ") } else { by_engine.join(", ") };
-                let narrowed = p
-                    .narrowed
-                    .as_ref()
-                    .map(|k| format!(" · narrowed by kind {k} to {} engines", p.engines_used.len()))
-                    .unwrap_or_default();
-                searches.push(format!(
-                    "{} [{}] {}: {} links, {} new · {engines_txt}{}{narrowed}",
-                    p.label,
-                    p.mode,
-                    crate::providers::thread::clip(&p.query, 120),
-                    total_here.len(),
-                    new_here,
-                    if resp.metadata.cached { " · cached" } else { "" }
-                ));
-            }
-            Err(e) => {
-                searches.push(format!(
-                    "{} [{}] {}: no answer (see Failures)",
-                    p.label,
-                    p.mode,
-                    crate::providers::thread::clip(&p.query, 120)
-                ));
-                failures.push(format!("{}: {}", p.label, crate::errors::redact_secrets(&e.to_string())));
-                if let crate::errors::SearchError::AllProvidersFailed { failed, .. } = e {
-                    for f in failed {
-                        failures.push(format!("  {} [{}] {}", f.provider, f.category.as_str(), crate::providers::thread::clip(&f.reason, 200)));
-                    }
-                }
-            }
-        }
-    }
-    // Community sources across their routes: Reddit threads (one thread can
-    // come from several routes), forum and discussion threads, Hacker News.
-    if planned.iter().any(|p| p.mode == Mode::Community && !p.side) {
-        let mut reddit: BTreeMap<&str, HashSet<&str>> = BTreeMap::new();
-        let (mut all, mut forums, mut hn, mut tg) = (HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new());
-        for (key, row) in &rows {
-            if crate::providers::telegram::channel_of(&row.url).is_some() {
-                tg.insert(key.as_str());
-            }
-            let is_thread = crate::providers::reddit::thread_ref(&row.url).is_some();
-            for s in &row.found_by {
-                let tail = s.q.trim_start_matches('q').trim_start_matches(|c: char| c.is_ascii_digit());
-                if is_thread {
-                    let route = match (tail, s.engine.as_str()) {
-                        ("l", _) | (_, "reddit-login") => "logged-in search",
-                        (_, "reddit") if s.web => "web fallback",
-                        (_, "reddit") => "Reddit's own search",
-                        ("r", _) => "web engines",
-                        _ => "other searches",
-                    };
-                    reddit.entry(route).or_default().insert(key.as_str());
-                    all.insert(key.as_str());
-                } else if s.engine == "hackernews" {
-                    hn.insert(key.as_str());
-                } else if tail.starts_with(['f', 'd', 'm', 'k']) {
-                    forums.insert(key.as_str());
-                }
-            }
-        }
-        let routes: Vec<String> = reddit.iter().map(|(r, s)| format!("{r} {}", s.len())).collect();
-        coverage.push(format!(
-            "community sources: Reddit {} threads ({}) · forum and discussion threads {} · Hacker News {} · Telegram {}",
-            all.len(),
-            if routes.is_empty() { "none".to_string() } else { routes.join(", ") },
-            forums.len(),
-            hn.len(),
-            tg.len()
-        ));
-    }
-    // URLs only one engine found, per engine: what each engine added.
-    let mut only: BTreeMap<String, usize> = BTreeMap::new();
-    for (engine, urls) in &engine_urls {
-        let n = urls
-            .iter()
-            .filter(|u| !engine_urls.iter().any(|(e, set)| e != engine && set.contains(*u)))
-            .count();
-        only.insert(engine.clone(), n);
-    }
-    let mut ranked: Vec<UrlRow> = order.iter().filter_map(|k| rows.remove(k)).collect();
-    ranked.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-    for (i, r) in ranked.iter_mut().enumerate() {
-        r.rank = i + 1;
-    }
-    if crate::config::get().research.rerank && !ranked.is_empty() {
-        let question = if req.topic.trim().is_empty() {
-            planned.iter().filter(|p| !p.side).map(|p| p.query.as_str()).collect::<Vec<_>>().join(" / ")
-        } else {
-            req.topic.clone()
-        };
-        if let Err(e) = rerank(&app, &question, &mut ranked).await {
-            warnings.push(format!("reranker skipped: {e}"));
-        }
-    }
+    let mut round_coverage = rounds.coverage;
 
     // Pages: the request's URLs, then the best result of each query, then a
     // second of each, then the rest by overall rank.
@@ -941,120 +729,6 @@ pub async fn run(app: Arc<AppContext>, req: Request) -> Result<Outcome, crate::e
             n
         }
     };
-    // Each pick: the address, the search that led to it, and why it was picked.
-    let mut picks: Vec<(String, String, &'static str)> = Vec::new();
-    for u in &req.urls {
-        if !run.has_url(u) {
-            picks.push((u.clone(), "url".into(), "url"));
-        }
-    }
-    let wanted = picks.len() + n_fetch;
-    let taken = |picks: &[(String, String, &'static str)], url: &str| {
-        run.has_url(url) || picks.iter().any(|(u, _, _)| normalize_url(u) == normalize_url(url))
-    };
-    // Side searches of another kind (GitHub beside a web question,
-    // alternatives) share at most a third of the pages; some have their own cap.
-    let by_label: HashMap<&str, &Planned> = planned.iter().map(|p| (p.label.as_str(), p)).collect();
-    let extra_side = |r: &UrlRow| -> Option<String> {
-        r.queries
-            .iter()
-            .all(|q| by_label.get(q.as_str()).is_some_and(|p| p.extra))
-            .then(|| r.queries.first().cloned().unwrap_or_default())
-    };
-    let extra_quota = (n_fetch / 3).max(1);
-    let mut extra_used = 0usize;
-    let mut per_side: HashMap<String, usize> = HashMap::new();
-    let mut allow = |r: &UrlRow, extra_used: &mut usize| -> bool {
-        let Some(label) = extra_side(r) else { return true };
-        let cap = by_label.get(label.as_str()).and_then(|p| p.cap).unwrap_or(usize::MAX);
-        let n = per_side.entry(label).or_default();
-        if *extra_used >= extra_quota || *n >= cap {
-            return false;
-        }
-        *n += 1;
-        *extra_used += 1;
-        true
-    };
-    // The best page of each query, then a second. Side searches of the same
-    // kind (community, code) count as queries: they are where the variety is.
-    let questions: Vec<&Planned> = planned.iter().filter(|p| !p.extra && p.guaranteed).collect();
-    for round in 0..2 {
-        for p in &questions {
-            if picks.len() >= wanted {
-                break;
-            }
-            // A side search gets one page here; the question itself a second.
-            if round == 1 && p.side {
-                continue;
-            }
-            let found = ranked
-                .iter()
-                .find(|r| r.queries.contains(&p.label) && !taken(&picks, &r.url) && extra_side(r).is_none());
-            if let Some(r) = found {
-                picks.push((r.url.clone(), p.label.clone(), if p.side { "side" } else { "question" }));
-            }
-        }
-    }
-    // Two slots for links only one engine found: agreement is popularity,
-    // not proof, and the single-engine finds are often the new ones.
-    let mut solo = 0;
-    for r in ranked.iter() {
-        if picks.len() >= wanted || solo >= 2 {
-            break;
-        }
-        if r.engines.len() == 1 && !taken(&picks, &r.url) && allow(r, &mut extra_used) {
-            picks.push((r.url.clone(), r.queries.first().cloned().unwrap_or_default(), "solo"));
-            solo += 1;
-        }
-    }
-    for r in ranked.iter() {
-        if picks.len() >= wanted {
-            break;
-        }
-        if !taken(&picks, &r.url) && allow(r, &mut extra_used) {
-            picks.push((r.url.clone(), r.queries.first().cloned().unwrap_or_default(), "rank"));
-        }
-    }
-    // The step returns once as many good pages are in as were picked. Pages
-    // from sites that keep walling us go to the background at once; spare
-    // picks start in their place, plus SPARE more, so walls and slow pages
-    // do not hold the run.
-    let enough = picks.iter().filter(|(_, from, _)| from != "url").count();
-    let walled = picks.iter().filter(|(u, _, _)| fetch::memory::walls_us(u)).count();
-    let more = if picks.is_empty() { 0 } else { walled + SPARE };
-    let mut spares = 0;
-    for r in ranked.iter() {
-        if spares >= more {
-            break;
-        }
-        if !taken(&picks, &r.url) && allow(r, &mut extra_used) {
-            picks.push((r.url.clone(), r.queries.first().cloned().unwrap_or_default(), "spare"));
-            spares += 1;
-        }
-    }
-    // Numbers given now (p1 the first pick); the results index written
-    // before any fetch, so a stopped run keeps it.
-    let ids = run.reserve(picks.len());
-    let why: Vec<serde_json::Value> = picks
-        .iter()
-        .zip(&ids)
-        .map(|((url, from, why), id)| serde_json::json!({ "id": id, "url": url, "from": from, "why": why }))
-        .collect();
-    let _ = run.write_json(&format!("picks.r{}.json", run.round), &why);
-    let mut targets: Vec<Target> = picks
-        .into_iter()
-        .zip(ids)
-        .map(|((url, from, _), id)| Target::new(url, from, id))
-        .collect();
-    for t in targets.iter_mut() {
-        if let Some(row) = ranked.iter_mut().find(|r| normalize_url(&r.url) == normalize_url(&t.url)) {
-            row.page = Some(t.id.clone());
-            t.date = row.found_by.iter().find_map(|f| f.published.clone());
-        }
-    }
-    for row in &ranked {
-        run.append_jsonl("results.jsonl", row);
-    }
     let fopts = FetchOpts {
         platforms: req.platforms.clone(),
         no_paid: req.no_paid_readers,
@@ -1067,15 +741,103 @@ pub async fn run(app: Arc<AppContext>, req: Request) -> Result<Outcome, crate::e
         req.fetch_time.unwrap_or(crate::config::get().research.fetchtime).max(1),
     );
     let soft = std::time::Duration::from_secs(if req.quick { rc.quicksoft } else { rc.softtime }.max(1));
-    let fetch_started = Instant::now();
-    let (targets, mut later) = if req.via.is_some() { (targets, Vec::new()) } else { split_walled(targets) };
+    let before: HashSet<String> = run.pages().iter().map(|p| normalize_url(&p.url)).collect();
+    // Each pick: the address, the search that led to it, and why it was picked.
+    let mut picks: Vec<Pick> = Vec::new();
+    for u in &req.urls {
+        if !run.has_url(u) {
+            picks.push((u.clone(), "url".into(), "url"));
+        }
+    }
+    let wanted = picks.len() + n_fetch;
+    // picks.rN.json: a fetch joining a round adds to that round's list.
+    let picks_file = format!("picks.r{}.json", run.round);
+    let mut why: Vec<serde_json::Value> = if attach {
+        std::fs::read_to_string(run.dir.join(&picks_file))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let mut page_ids: Vec<(String, String)> = Vec::new();
+    let mut new_pages: Vec<PageEntry> = Vec::new();
+    let mut later: Vec<crate::finish::Pending> = Vec::new();
+    let mut first_fetch = std::time::Duration::ZERO;
+    // Picks already turned into fetch targets (page numbers given).
+    let mut given = 0usize;
+
+    // Reddit's round (logged-in searches at `research.redditpace`) can take
+    // much longer than the rest: on a community run the pages found so far
+    // start fetching while it runs, with room kept for what it finds.
+    let reddit_due = n_fetch > 0 && req.via.is_none() && planned.iter().any(|p| p.mode == Mode::Community && !p.side);
+    let reddit = if reddit_due {
+        let mut first = build_index(&app, &req, &planned, &responses, &recorder, &before, &round_coverage).await;
+        if rc.redditfill {
+            fill_reddit_dates(&app, &mut first.ranked).await;
+        }
+        let parents = planned.iter().filter(|p| p.mode == Mode::Community && !p.side).count();
+        let room = (parents * (rc.redditsubs + 2)).min(n_fetch / 2);
+        let enough = choose(&run, &first.ranked, &planned, &mut picks, wanted.saturating_sub(room), n_fetch);
+        let targets = targets_for(&mut run, &picks, &first.ranked, &mut why, &mut page_ids);
+        given = picks.len();
+        let _ = run.write_json(&picks_file, &why);
+        let (targets, walled) = split_walled(targets);
+        later.extend(walled);
+        let limits = Limits { hard: Some(budget), soft: Some(soft), enough: Some(enough) };
+        let (reddit, ((pages, left), took)) = tokio::join!(
+            crate::rounds::reddit::round(&app, &recorder, &planned, &responses, &req, no_cache),
+            async {
+                let t = Instant::now();
+                let r = fetch_all(&app, &recorder, &mut run, targets, &fopts, &limits).await;
+                (r, t.elapsed())
+            },
+        );
+        first_fetch = took;
+        new_pages.extend(pages);
+        later.extend(left);
+        reddit
+    } else {
+        crate::rounds::reddit::round(&app, &recorder, &planned, &responses, &req, no_cache).await
+    };
+    planned.extend(reddit.planned);
+    responses.extend(reddit.responses);
+    warnings.extend(reddit.notes);
+    round_coverage.extend(reddit.coverage);
+    crate::rounds::forums::learn(&planned, &responses);
+
+    // The results index over every search, then the rest of the pages.
+    let Index { mut ranked, searches, coverage, only, answers, failures, warnings: noted, mut cost_micros } =
+        build_index(&app, &req, &planned, &responses, &recorder, &before, &round_coverage).await;
+    warnings.extend(noted);
+    if rc.redditfill {
+        fill_reddit_dates(&app, &mut ranked).await;
+    }
+    let enough = choose(&run, &ranked, &planned, &mut picks, wanted, n_fetch);
+    // Numbers given now (p1 the first pick); the results index written
+    // before any fetch, so a stopped run keeps it.
+    let targets = targets_for(&mut run, &picks[given..], &ranked, &mut why, &mut page_ids);
+    let _ = run.write_json(&picks_file, &why);
+    for row in ranked.iter_mut() {
+        let key = normalize_url(&row.url);
+        if let Some((_, id)) = page_ids.iter().find(|(u, _)| *u == key) {
+            row.page = Some(id.clone());
+        }
+        row.round = run.round;
+        run.append_jsonl("results.jsonl", &*row);
+    }
+    let (targets, walled) = if req.via.is_some() { (targets, Vec::new()) } else { split_walled(targets) };
+    later.extend(walled);
+    let hard = budget.saturating_sub(first_fetch).max(soft.min(budget));
     // Pages asked for by address are waited for in full.
     let limits = if req.queries.is_empty() {
-        Limits { hard: Some(budget), ..Limits::default() }
+        Limits { hard: Some(hard), ..Limits::default() }
     } else {
-        Limits { hard: Some(budget), soft: Some(soft), enough: Some(enough) }
+        Limits { hard: Some(hard), soft: Some(soft), enough: Some(enough) }
     };
-    let (mut new_pages, left) = fetch_all(&app, &recorder, &mut run, targets, &fopts, &limits).await;
+    let fetch_started = Instant::now();
+    let (pages, left) = fetch_all(&app, &recorder, &mut run, targets, &fopts, &limits).await;
+    new_pages.extend(pages);
     later.extend(left);
 
     // Snowballing: links that several fetched pages share.
@@ -1086,7 +848,7 @@ pub async fn run(app: Arc<AppContext>, req: Request) -> Result<Outcome, crate::e
         .chain(run.pages().iter().map(|p| normalize_url(&p.url)))
         .collect();
     let candidates = snowball(&run, &new_pages, &known);
-    let left = budget.saturating_sub(fetch_started.elapsed());
+    let left = hard.saturating_sub(fetch_started.elapsed());
     if n_snow > 0 && !candidates.is_empty() && left.is_zero() {
         warnings.push("snowball skipped: the fetch time budget was used up".into());
     } else if n_snow > 0 && !candidates.is_empty() {
@@ -1168,12 +930,21 @@ pub async fn run(app: Arc<AppContext>, req: Request) -> Result<Outcome, crate::e
     if let (Some(q), Some(p)) = (&jina, &jina_page) {
         summary.push_str(&crate::jinadeep::summary(&run.id, q, p));
     }
-    run.write_text(&format!("summary.r{}.md", run.round), &summary)?;
-    run.write_text("summary.md", &summary)?;
-    // AI synthesis: waited for, or left running in its own process.
-    if crate::synth::wanted(&req, &planned) {
-        summary.push_str(&crate::synth::after_run(&app, &run, &req).await);
+    let saved = summary.replacen(SYNTH_MARK, "", 1);
+    // A joined fetch prints its own summary and leaves the round's as it is.
+    if !attach {
+        run.write_text(&format!("summary.r{}.md", run.round), &saved)?;
+        run.write_text("summary.md", &saved)?;
     }
+    // AI synthesis: waited for, or left running in its own process. Its
+    // status and short answer go near the top of what is printed.
+    let printed = if crate::synth::wanted(&req, &planned) {
+        crate::synth::after_run(&app, &run, &req).await
+    } else {
+        crate::synth::Printed { top: crate::synth::not_set_up(&req).unwrap_or_default(), tail: String::new() }
+    };
+    summary = summary.replacen(SYNTH_MARK, &printed.top, 1);
+    summary.push_str(&printed.tail);
     run.index(&RunLine {
         id: run.id.clone(),
         round: run.round,
@@ -1183,12 +954,417 @@ pub async fn run(app: Arc<AppContext>, req: Request) -> Result<Outcome, crate::e
         urls: ranked.len(),
         pages: new_pages.iter().filter(|p| p.ok).count(),
         cost_usd: cost_micros as f64 / 1e6,
-        kind: "research".into(),
+        kind: if attach { "fetch" } else { "research" }.into(),
     });
     Ok(Outcome {
         summary,
         run_dir: run.dir.clone(),
     })
+}
+
+/// A page pick: the address, the search that led to it, and why.
+type Pick = (String, String, &'static str);
+
+/// What a round's searches found: every URL with every engine's sighting,
+/// ranked, one line per search, the coverage lines, the links each engine
+/// alone found, engine answers, failures, warnings and the search cost.
+struct Index {
+    ranked: Vec<UrlRow>,
+    searches: Vec<String>,
+    coverage: Vec<String>,
+    only: BTreeMap<String, usize>,
+    answers: Vec<(String, String, String)>,
+    failures: Vec<String>,
+    warnings: Vec<String>,
+    cost_micros: u64,
+}
+
+/// The results index of the searches so far. `before`: pages the run had
+/// already read, which do not count as new.
+async fn build_index(
+    app: &Arc<AppContext>,
+    req: &Request,
+    planned: &[Planned],
+    responses: &BTreeMap<String, Result<SearchResponse, crate::errors::SearchError>>,
+    recorder: &raw::Recorder,
+    before: &HashSet<String>,
+    round_coverage: &[String],
+) -> Index {
+    let mut warnings: Vec<String> = Vec::new();
+    // The results index: every URL with every engine's sighting.
+    let calls = recorder.calls();
+    let raw_for = |label: &str, engine: &str| -> Option<String> {
+        calls
+            .iter()
+            .filter(|c| c.label == label && c.provider.eq_ignore_ascii_case(engine))
+            .last()
+            .map(|c| c.raw.clone())
+    };
+    let mut rows: HashMap<String, UrlRow> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    let mut answers: Vec<(String, String, String)> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+    let mut cost_micros = 0u64;
+    // One line per search (what it asked, found and from whom), then the
+    // community and found-by-one-engine lines in `coverage`.
+    let mut searches: Vec<String> = Vec::new();
+    let mut coverage: Vec<String> = round_coverage.to_vec();
+    let mut seen_urls: HashSet<String> = before.clone();
+    let mut engine_urls: BTreeMap<String, HashSet<String>> = BTreeMap::new();
+    for p in planned {
+        let Some(r) = responses.get(&p.label) else {
+            searches.push(format!(
+                "{} [{}] {}: no answer recorded",
+                p.label,
+                p.mode,
+                crate::providers::thread::clip(&p.query, 120)
+            ));
+            continue;
+        };
+        match r {
+            Ok(resp) => {
+                cost_micros += resp.metadata.cost.as_ref().map_or(0, |c| c.micros);
+                for f in &resp.metadata.provider_failures {
+                    failures.push(format!("{} {}: [{}] {}", p.label, f.provider, f.category.as_str(), crate::providers::thread::clip(&f.reason, 200)));
+                }
+                for w in &resp.metadata.warnings {
+                    warnings.push(format!("{}: {w}", p.label));
+                }
+                for a in &resp.answers {
+                    answers.push((p.label.clone(), a.provider.clone(), a.text.clone()));
+                }
+                let buckets: Vec<(String, Vec<crate::types::SearchResult>)> =
+                    if resp.per_provider.is_empty() {
+                        replay_buckets(&resp.results)
+                    } else {
+                        resp.per_provider.clone()
+                    };
+                let mut new_here = 0;
+                let mut total_here = HashSet::new();
+                for (engine, items) in buckets {
+                    // Serper sometimes answers with Google redirect links in place
+                    // of the real addresses: they cannot be matched or read.
+                    let redirects = items.iter().filter(|it| it.url.contains("google.com/url?")).count();
+                    if redirects > 0 {
+                        warnings.push(format!(
+                            "{} {engine}: {redirects} of {} results are Google redirect links, not page addresses; they cannot be matched with other engines' results or read",
+                            p.label,
+                            items.len()
+                        ));
+                    }
+                    // Reddit refused its own search and a web search of reddit.com
+                    // answered in its place: that one cannot apply a date limit.
+                    if engine == "reddit"
+                        && p.opts.freshness.is_some()
+                        && items.iter().any(|it| it.extra.as_ref().is_some_and(|e| e["route"] == "web"))
+                    {
+                        warnings.push(format!(
+                            "{}: Reddit refused its own search; the web search used in its place does not apply -f, so its threads can be older (each page shows its own date)",
+                            p.label
+                        ));
+                    }
+                    for (i, it) in items.iter().enumerate() {
+                        if it.url.is_empty() {
+                            continue;
+                        }
+                        let key = normalize_url(&it.url);
+                        total_here.insert(key.clone());
+                        engine_urls.entry(engine.clone()).or_default().insert(key.clone());
+                        if seen_urls.insert(key.clone()) {
+                            new_here += 1;
+                        }
+                        let row = rows.entry(key.clone()).or_insert_with(|| {
+                            order.push(key.clone());
+                            UrlRow {
+                                rank: 0,
+                                url: it.url.clone(),
+                                title: it.title.clone(),
+                                score: 0.0,
+                                engines: Vec::new(),
+                                queries: Vec::new(),
+                                found_by: Vec::new(),
+                                page: None,
+                                round: 0,
+                            }
+                        });
+                        row.score += 1.0 / (60.0 + i as f64 + 1.0);
+                        if !row.engines.contains(&engine) {
+                            row.engines.push(engine.clone());
+                        }
+                        if !row.queries.contains(&p.label) {
+                            row.queries.push(p.label.clone());
+                        }
+                        if row.title.is_empty() {
+                            row.title = it.title.clone();
+                        }
+                        row.found_by.push(Sighting {
+                            q: p.label.clone(),
+                            engine: engine.clone(),
+                            rank: i + 1,
+                            title: it.title.clone(),
+                            snippet: it.snippet.clone(),
+                            published: it.published.clone(),
+                            raw: raw_for(&p.label, &engine),
+                            web: engine == "reddit" && it.extra.as_ref().is_some_and(|e| e["route"] == "web"),
+                        });
+                    }
+                }
+                let by_engine: Vec<String> = resp
+                    .metadata
+                    .provider_results
+                    .iter()
+                    .map(|(e, n)| format!("{e} {n}"))
+                    .collect();
+                let engines_txt = if by_engine.is_empty() { p.engines_used.join(", ") } else { by_engine.join(", ") };
+                let narrowed = p
+                    .narrowed
+                    .as_ref()
+                    .map(|k| format!(" · narrowed by kind {k} to {} engines", p.engines_used.len()))
+                    .unwrap_or_default();
+                searches.push(format!(
+                    "{} [{}] {}: {} links, {} new · {engines_txt}{}{narrowed}",
+                    p.label,
+                    p.mode,
+                    crate::providers::thread::clip(&p.query, 120),
+                    total_here.len(),
+                    new_here,
+                    if resp.metadata.cached { " · cached" } else { "" }
+                ));
+            }
+            Err(e) => {
+                searches.push(format!(
+                    "{} [{}] {}: no answer (see Failures)",
+                    p.label,
+                    p.mode,
+                    crate::providers::thread::clip(&p.query, 120)
+                ));
+                failures.push(format!("{}: {}", p.label, crate::errors::redact_secrets(&e.to_string())));
+                if let crate::errors::SearchError::AllProvidersFailed { failed, .. } = e {
+                    for f in failed {
+                        failures.push(format!("  {} [{}] {}", f.provider, f.category.as_str(), crate::providers::thread::clip(&f.reason, 200)));
+                    }
+                }
+            }
+        }
+    }
+    // Community sources across their routes: Reddit threads (one thread can
+    // come from several routes), forum and discussion threads, Hacker News.
+    if planned.iter().any(|p| p.mode == Mode::Community && !p.side) {
+        let mut reddit: BTreeMap<&str, HashSet<&str>> = BTreeMap::new();
+        let (mut all, mut forums, mut hn, mut tg) = (HashSet::new(), HashSet::new(), HashSet::new(), HashSet::new());
+        for (key, row) in &rows {
+            if crate::providers::telegram::channel_of(&row.url).is_some() {
+                tg.insert(key.as_str());
+            }
+            let is_thread = crate::providers::reddit::thread_ref(&row.url).is_some();
+            for s in &row.found_by {
+                let tail = s.q.trim_start_matches('q').trim_start_matches(|c: char| c.is_ascii_digit());
+                if is_thread {
+                    let route = match (tail, s.engine.as_str()) {
+                        ("e", _) => "logged-in comment search",
+                        ("l", _) | (_, "reddit-login") => "logged-in search",
+                        (_, "reddit") if s.web => "web fallback",
+                        (_, "reddit") => "Reddit's own search",
+                        ("r", _) => "web engines",
+                        _ => "other searches",
+                    };
+                    reddit.entry(route).or_default().insert(key.as_str());
+                    all.insert(key.as_str());
+                } else if s.engine == "hackernews" {
+                    hn.insert(key.as_str());
+                } else if tail.starts_with(['f', 'd', 'm', 'k']) {
+                    forums.insert(key.as_str());
+                }
+            }
+        }
+        let routes: Vec<String> = reddit.iter().map(|(r, s)| format!("{r} {}", s.len())).collect();
+        coverage.push(format!(
+            "community sources: Reddit {} threads ({}) · forum and discussion threads {} · Hacker News {} · Telegram {}",
+            all.len(),
+            if routes.is_empty() { "none".to_string() } else { routes.join(", ") },
+            forums.len(),
+            hn.len(),
+            tg.len()
+        ));
+    }
+    // URLs only one engine found, per engine: what each engine added.
+    let mut only: BTreeMap<String, usize> = BTreeMap::new();
+    for (engine, urls) in &engine_urls {
+        let n = urls
+            .iter()
+            .filter(|u| !engine_urls.iter().any(|(e, set)| e != engine && set.contains(*u)))
+            .count();
+        only.insert(engine.clone(), n);
+    }
+    let mut ranked: Vec<UrlRow> = order.iter().filter_map(|k| rows.remove(k)).collect();
+    ranked.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    for (i, r) in ranked.iter_mut().enumerate() {
+        r.rank = i + 1;
+    }
+    if crate::config::get().research.rerank && !ranked.is_empty() {
+        let question = if req.topic.trim().is_empty() {
+            planned.iter().filter(|p| !p.side).map(|p| p.query.as_str()).collect::<Vec<_>>().join(" / ")
+        } else {
+            req.topic.clone()
+        };
+        if let Err(e) = rerank(app, &question, &mut ranked).await {
+            warnings.push(format!("reranker skipped: {e}"));
+        }
+    }
+
+    Index { ranked, searches, coverage, only, answers, failures, warnings, cost_micros }
+}
+
+/// Add page picks until `picks` holds `wanted` (picks already there count,
+/// and a query that has its pages gets no more): the best page of each
+/// query, then a second of each question (same-kind side searches count as
+/// queries: they are where the variety is); two links only one engine found
+/// (agreement is popularity, not proof, and the single-engine finds are
+/// often the new ones); then overall rank; then spares, so walls and slow
+/// pages do not hold the run. Side searches of another kind (GitHub beside a
+/// web question, alternatives) share at most a third of the pages; some have
+/// their own cap. Returns how many added picks the fetch step waits for.
+fn choose(run: &Run, ranked: &[UrlRow], planned: &[Planned], picks: &mut Vec<Pick>, wanted: usize, n_fetch: usize) -> usize {
+    let start = picks.len();
+    let taken = |picks: &[Pick], url: &str| {
+        run.has_url(url) || picks.iter().any(|(u, _, _)| normalize_url(u) == normalize_url(url))
+    };
+    let by_label: HashMap<&str, &Planned> = planned.iter().map(|p| (p.label.as_str(), p)).collect();
+    let extra_side = |r: &UrlRow| -> Option<String> {
+        r.queries
+            .iter()
+            .all(|q| by_label.get(q.as_str()).is_some_and(|p| p.extra))
+            .then(|| r.queries.first().cloned().unwrap_or_default())
+    };
+    let extra_quota = (n_fetch / 3).max(1);
+    let mut extra_used = 0usize;
+    let mut per_side: HashMap<String, usize> = HashMap::new();
+    for (_, from, _) in picks.iter() {
+        if by_label.get(from.as_str()).is_some_and(|p| p.extra) {
+            *per_side.entry(from.clone()).or_default() += 1;
+            extra_used += 1;
+        }
+    }
+    let mut allow = |r: &UrlRow, extra_used: &mut usize| -> bool {
+        let Some(label) = extra_side(r) else { return true };
+        let cap = by_label.get(label.as_str()).and_then(|p| p.cap).unwrap_or(usize::MAX);
+        let n = per_side.entry(label).or_default();
+        if *extra_used >= extra_quota || *n >= cap {
+            return false;
+        }
+        *n += 1;
+        *extra_used += 1;
+        true
+    };
+    let questions: Vec<&Planned> = planned.iter().filter(|p| !p.extra && p.guaranteed).collect();
+    for round in 0..2 {
+        for p in &questions {
+            if picks.len() >= wanted {
+                break;
+            }
+            // A side search gets one page here; the question itself a second.
+            if round == 1 && p.side {
+                continue;
+            }
+            if picks.iter().filter(|(_, from, _)| *from == p.label).count() > round {
+                continue;
+            }
+            let found = ranked
+                .iter()
+                .find(|r| r.queries.contains(&p.label) && !taken(picks, &r.url) && extra_side(r).is_none());
+            if let Some(r) = found {
+                picks.push((r.url.clone(), p.label.clone(), if p.side { "side" } else { "question" }));
+            }
+        }
+    }
+    let mut solo = picks.iter().filter(|(_, _, why)| *why == "solo").count();
+    for r in ranked {
+        if picks.len() >= wanted || solo >= 2 {
+            break;
+        }
+        if r.engines.len() == 1 && !taken(picks, &r.url) && allow(r, &mut extra_used) {
+            picks.push((r.url.clone(), r.queries.first().cloned().unwrap_or_default(), "solo"));
+            solo += 1;
+        }
+    }
+    for r in ranked {
+        if picks.len() >= wanted {
+            break;
+        }
+        if !taken(picks, &r.url) && allow(r, &mut extra_used) {
+            picks.push((r.url.clone(), r.queries.first().cloned().unwrap_or_default(), "rank"));
+        }
+    }
+    // The fetch step returns once as many good pages are in as were picked.
+    // Pages from sites that keep walling us go to the background at once;
+    // spare picks start in their place, plus SPARE more.
+    let (enough, more) = {
+        let added = &picks[start..];
+        let enough = added.iter().filter(|(_, from, _)| from != "url").count();
+        let walled = added.iter().filter(|(u, _, _)| fetch::memory::walls_us(u)).count();
+        (enough, if added.is_empty() { 0 } else { walled + SPARE })
+    };
+    let mut spares = 0;
+    for r in ranked {
+        if spares >= more {
+            break;
+        }
+        if !taken(picks, &r.url) && allow(r, &mut extra_used) {
+            picks.push((r.url.clone(), r.queries.first().cloned().unwrap_or_default(), "spare"));
+            spares += 1;
+        }
+    }
+    enough
+}
+
+/// Page numbers for new picks (p1 the first of the run), their lines for
+/// picks.rN.json, and fetch targets carrying the date an engine gave.
+fn targets_for(
+    run: &mut Run,
+    picks: &[Pick],
+    ranked: &[UrlRow],
+    why: &mut Vec<serde_json::Value>,
+    page_ids: &mut Vec<(String, String)>,
+) -> Vec<Target> {
+    let ids = run.reserve(picks.len());
+    picks
+        .iter()
+        .zip(ids)
+        .map(|((url, from, reason), id)| {
+            why.push(serde_json::json!({ "id": id, "url": url, "from": from, "why": reason }));
+            let key = normalize_url(url);
+            page_ids.push((key.clone(), id.clone()));
+            let mut t = Target::new(url.clone(), from.clone(), id);
+            t.date = ranked
+                .iter()
+                .find(|r| normalize_url(&r.url) == key)
+                .and_then(|r| r.found_by.iter().find_map(|f| f.published.clone()));
+            t
+        })
+        .collect()
+}
+
+/// Reddit threads no engine gave a date get their creation date from the
+/// archive (`research.redditfill`).
+async fn fill_reddit_dates(app: &Arc<AppContext>, ranked: &mut [UrlRow]) {
+    let ids: HashSet<String> = ranked
+        .iter()
+        .filter(|r| r.found_by.iter().all(|f| f.published.is_none()))
+        .filter_map(|r| crate::providers::reddit::thread_ref(&r.url).map(|(_, id)| id))
+        .collect();
+    if ids.is_empty() {
+        return;
+    }
+    let ids: Vec<String> = ids.into_iter().collect();
+    let dates = crate::providers::reddit::Reddit::new(app.clone()).archive_dates(&ids).await;
+    for r in ranked.iter_mut() {
+        let Some((_, id)) = crate::providers::reddit::thread_ref(&r.url) else { continue };
+        if let Some(d) = dates.get(&id) {
+            for f in r.found_by.iter_mut().filter(|f| f.published.is_none()) {
+                f.published = Some(d.clone());
+            }
+        }
+    }
 }
 
 /// Rows sent to the reranker.
@@ -1491,6 +1667,20 @@ pub fn leave_to_background(run: &mut Run, pending: Vec<crate::finish::Pending>, 
     if pending.is_empty() {
         return None;
     }
+    // One background process per round: a fetch that joined a round whose
+    // own background fetch is still going saves its unfinished pages with
+    // the command to retry instead of starting a second one.
+    if crate::finish::round_running(&run.dir, run.round) {
+        let urls: Vec<String> = pending.iter().map(|p| p.url.clone()).collect();
+        let run_id = run.id.clone();
+        save_unfinished(run, pending, false, |p| format!("not finished; retry: osearch fetch {} --parent {run_id}", p.url));
+        return Some(format!(
+            "{} page(s) not finished in time (this round's background fetch is still running); retry: osearch fetch {} --parent {}",
+            urls.len(),
+            urls.join(" "),
+            run.id
+        ));
+    }
     let list: Vec<String> = pending.iter().map(|p| format!("{} ({})", p.id, host(&p.url))).collect();
     match crate::finish::hand_off(run, &pending, opts) {
         Ok(()) => Some(format!(
@@ -1789,14 +1979,17 @@ fn render_summary(s: &SummaryIn<'_>) -> String {
         } else {
             String::new()
         };
+        let pending = crate::finish::pending_in(&s.run.dir).len();
+        let later = if pending > 0 { format!(", {pending} more still fetching in the background") } else { String::new() };
         let _ = writeln!(
             out,
-            "pages: {ok_pages} read of {} results (limit {}, the default for this run is {}){more}",
+            "pages: {ok_pages} read of {} results{later} (limit {}, the default for this run is {}){more}",
             s.ranked.len(),
             s.fetch_n,
             s.fetch_default
         );
     }
+    out.push_str(SYNTH_MARK);
     let contract = crate::tools::contract_warnings();
     if !contract.is_empty() {
         let _ = writeln!(out, "\n## !!! CONTRACT WARNINGS: an outside tool changed or crashed\n");
@@ -1986,9 +2179,11 @@ fn render_summary(s: &SummaryIn<'_>) -> String {
 }
 
 const TOKENS_MARK: &str = "\u{1}tokens\u{1}";
+/// Where the synthesis status (and short answer) goes once it is known.
+const SYNTH_MARK: &str = "\u{1}synth\u{1}";
 
 fn file_tokens(path: &std::path::Path) -> usize {
-    std::fs::read_to_string(path).map(|t| outline::tokens(&t)).unwrap_or(0)
+    crate::run::read_text(path).map(|t| outline::tokens(&t)).unwrap_or(0)
 }
 
 /// Tokens of the engines' raw answers; fetched pages' bodies left out.

@@ -228,10 +228,13 @@ pub async fn read_thread(ctx: Arc<AppContext>, url: &str, read: Read) -> Result<
 
 /// Burst allowance; Reddit served a captcha after 14 requests in 10 s.
 const BURST: f64 = 5.0;
-/// Sustained rate: 10 requests a minute held for an hour in testing.
-const PER_SEC: f64 = 10.0 / 60.0;
 /// How long the live route rests after a captcha (it cleared in about 7 min).
 const COOLDOWN_SECS: f64 = 420.0;
+
+/// The sustained rate in requests a second (`research.redditpace` a minute).
+fn per_sec() -> f64 {
+    crate::config::get().research.redditpace.max(1) as f64 / 60.0
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize, serde::Serialize)]
 pub struct Bucket {
@@ -252,16 +255,17 @@ impl Bucket {
         }
     }
 
-    /// Take one token at `now`, or say how long until one is free.
-    pub fn take(&mut self, now: f64) -> Result<(), Duration> {
+    /// Take one token at `now`, refilling at `per_sec`, or say how long
+    /// until one is free.
+    pub fn take(&mut self, now: f64, per_sec: f64) -> Result<(), Duration> {
         let elapsed = (now - self.at).max(0.0);
-        self.tokens = (self.tokens + elapsed * PER_SEC).min(BURST);
+        self.tokens = (self.tokens + elapsed * per_sec).min(BURST);
         self.at = now;
         if self.tokens >= 1.0 {
             self.tokens -= 1.0;
             Ok(())
         } else {
-            Err(Duration::from_secs_f64((1.0 - self.tokens) / PER_SEC))
+            Err(Duration::from_secs_f64((1.0 - self.tokens) / per_sec))
         }
     }
 
@@ -279,19 +283,28 @@ fn now_secs() -> f64 {
         .as_secs_f64()
 }
 
-fn pace_path() -> std::path::PathBuf {
-    crate::cache::cache_dir().join("reddit-pace.json")
+/// The shared bucket (the pace, and the rest after a captcha, which is per
+/// address); with side-by-side searches each account also paces its own
+/// requests in a bucket of its own.
+fn pace_path(account: Option<&str>) -> std::path::PathBuf {
+    let dir = crate::cache::cache_dir();
+    match account {
+        Some(a) => {
+            let name: String = a.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect();
+            dir.join(format!("reddit-pace-{name}.json"))
+        }
+        None => dir.join("reddit-pace.json"),
+    }
 }
 
-fn load_bucket(now: f64) -> Bucket {
-    std::fs::read_to_string(pace_path())
+fn load_bucket(path: &std::path::Path, now: f64) -> Bucket {
+    std::fs::read_to_string(path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| Bucket::full(now))
 }
 
-fn save_bucket(b: &Bucket) {
-    let path = pace_path();
+fn save_bucket(path: &std::path::Path, b: &Bucket) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -306,20 +319,31 @@ fn save_bucket(b: &Bucket) {
 /// Wait for a live-request token, at most `max_wait`. `Err` says why not:
 /// resting after a captcha, or the next token is too far off.
 async fn acquire(max_wait: Duration) -> Result<(), String> {
+    let rc = &crate::config::get().research;
+    let rate = per_sec();
     loop {
         let wait = {
             let _guard = PACE.lock().unwrap_or_else(|e| e.into_inner());
             let now = now_secs();
-            let mut b = load_bucket(now);
+            let shared = pace_path(None);
+            let mut b = load_bucket(&shared, now);
             if let Some(rest) = b.resting(now) {
                 return Err(format!(
                     "reddit served a captcha recently; live pages rest for {} more s",
                     rest.as_secs()
                 ));
             }
-            match b.take(now) {
+            let own = rc.redditsidebyside.then(|| pace_path(Some(&crate::cookies::current_account())));
+            let path = match &own {
+                Some(p) => {
+                    b = load_bucket(p, now);
+                    p.clone()
+                }
+                None => shared,
+            };
+            match b.take(now, rate) {
                 Ok(()) => {
-                    save_bucket(&b);
+                    save_bucket(&path, &b);
                     return Ok(());
                 }
                 Err(wait) => wait,
@@ -327,7 +351,8 @@ async fn acquire(max_wait: Duration) -> Result<(), String> {
         };
         if wait > max_wait {
             return Err(format!(
-                "paced: about 10 Reddit requests a minute; the next is free in {} s",
+                "paced: about {} Reddit requests a minute; the next is free in {} s",
+                rc.redditpace.max(1),
                 wait.as_secs() + 1
             ));
         }
@@ -388,6 +413,13 @@ async fn rss_slot(kind: Keyless, max_wait: Duration) -> Result<(), String> {
 
 /// A Reddit page without a login, paced by its kind.
 async fn rss_get(ctx: &AppContext, kind: Keyless, url: &str, timeout: Duration) -> Result<String, String> {
+    let route = match kind {
+        Keyless::Rss => "rss",
+        Keyless::Listing => "listing",
+    };
+    if let Some(note) = refused_note(route) {
+        return Err(format!("reddit {route}: {note}"));
+    }
     rss_slot(kind, timeout.saturating_sub(Duration::from_secs(4))).await?;
     let started = std::time::Instant::now();
     let resp = ctx
@@ -404,7 +436,12 @@ async fn rss_get(ctx: &AppContext, kind: Keyless, url: &str, timeout: Duration) 
     match status {
         200..=299 => Ok(body),
         429 => Err("reddit rss: HTTP 429 (rate limit)".into()),
-        s => Err(format!("reddit rss: HTTP {s}")),
+        s => {
+            if s == 403 {
+                mark_refused(route);
+            }
+            Err(format!("reddit rss: HTTP {s}"))
+        }
     }
 }
 
@@ -501,11 +538,54 @@ pub async fn subreddit_top(ctx: &AppContext, sub: &str, timeout: Duration) -> Re
 fn start_cooldown() {
     let _guard = PACE.lock().unwrap_or_else(|e| e.into_inner());
     let now = now_secs();
-    let mut b = load_bucket(now);
+    let path = pace_path(None);
+    let mut b = load_bucket(&path, now);
     b.cooldown_until = now + COOLDOWN_SECS;
     b.tokens = 0.0;
     b.at = now;
-    save_bucket(&b);
+    save_bucket(&path, &b);
+}
+
+/// Routes Reddit refused (HTTP 403), remembered across runs for
+/// `research.redditrefused` hours: route name to unix seconds.
+fn refused_path() -> std::path::PathBuf {
+    crate::cache::cache_dir().join("reddit-refused.json")
+}
+
+fn refused_map() -> HashMap<String, f64> {
+    std::fs::read_to_string(refused_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Why `route` is skipped now, when Reddit refused it on a recent run.
+fn refused_note(route: &str) -> Option<String> {
+    if crate::config::get().research.redditrefused == 0 {
+        return None;
+    }
+    let until = refused_map().get(route).copied().filter(|t| *t > now_secs())?;
+    Some(format!(
+        "skipped: Reddit refused it (HTTP 403) on a recent run; tried again in {} (research.redditrefused)",
+        age(until - now_secs())
+    ))
+}
+
+fn mark_refused(route: &str) {
+    let hours = crate::config::get().research.redditrefused;
+    if hours == 0 {
+        return;
+    }
+    let _guard = PACE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = refused_map();
+    map.insert(route.to_string(), now_secs() + hours as f64 * 3600.0);
+    let path = refused_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(text) = serde_json::to_string(&map) {
+        let _ = std::fs::write(path, text);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -633,6 +713,9 @@ async fn live_page(
     if LIVE_REFUSED.load(std::sync::atomic::Ordering::Relaxed) {
         return Err("live route skipped: Reddit refused it earlier in this run (HTTP 403)".into());
     }
+    if let Some(note) = refused_note("live") {
+        return Err(format!("live route {note}"));
+    }
     let deadline = tokio::time::Instant::now() + timeout;
     let mut why = String::new();
     for profile in live_profiles() {
@@ -664,6 +747,7 @@ async fn live_page(
     }
     if why.starts_with("HTTP 403") {
         LIVE_REFUSED.store(true, std::sync::atomic::Ordering::Relaxed);
+        mark_refused("live");
     }
     Err(why)
 }
@@ -856,6 +940,8 @@ struct ArchiveList<T> {
 
 #[derive(Debug, Deserialize)]
 struct ArchivePost {
+    #[serde(default)]
+    id: String,
     #[serde(default)]
     title: String,
     #[serde(default)]
@@ -1064,9 +1150,11 @@ fn archive_stamp(meta: &PostMeta, not_live: Option<&str>) -> String {
     // A young post: how soon the archive saved it matters; an old one: its age.
     let mut s = match (meta.created, meta.retrieved) {
         (Some(c), Some(r)) if now_secs() - c < 3.0 * 86_400.0 => format!(
-            "Reddit archive copy (Arctic Shift) of a post {} old, saved {} after posting; comments may be missing",
+            "Reddit archive copy (Arctic Shift) of a post {} old, saved {} after posting; {}comments may be missing",
             age(now_secs() - c),
-            age(r - c)
+            age(r - c),
+            // Under a day and a half old, the archive's score is a snapshot.
+            if now_secs() - c < 36.0 * 3600.0 { "its score is still pending and " } else { "" }
         ),
         (Some(c), _) => format!(
             "Reddit archive copy (Arctic Shift) of a post {} old; scores as the archive last saved them",
@@ -1163,12 +1251,45 @@ fn slug_title(url: &str) -> String {
 // Calls
 
 impl Reddit {
+    /// Creation dates (YYYY-MM-DD) of threads by post id, from the archive,
+    /// at most 100 ids a call.
+    pub async fn archive_dates(&self, ids: &[String]) -> HashMap<String, String> {
+        let mut out = HashMap::new();
+        if !routes().archive {
+            return out;
+        }
+        for chunk in ids.chunks(100) {
+            let path = format!("posts/ids?ids={}", chunk.join(","));
+            let Ok(body) = self.archive_get(&path, Duration::from_secs(15)).await else { continue };
+            let Ok(list) = serde_json::from_str::<ArchiveList<ArchivePost>>(&body) else { continue };
+            for p in list.data {
+                if let Some(t) = p.created_utc {
+                    let date: String = thread::iso_from_unix(t as i64).chars().take(10).collect();
+                    out.insert(p.id.to_ascii_lowercase(), date);
+                }
+            }
+        }
+        out
+    }
+
     async fn archive_get(&self, path: &str, timeout: Duration) -> Result<String, String> {
         let url = format!("{ARCHIVE}/{path}");
-        let resp = super::send(self, timeout, || self.ctx.client.get(&url))
-            .await
-            .map_err(archive_error)?;
-        resp.text().await.map_err(archive_error)
+        // The archive refuses bursts (HTTP 429, "Too many requests"): wait
+        // and try again within the call's time, staggered so the calls of
+        // one burst do not all come back together.
+        let started = std::time::Instant::now();
+        let stagger = Duration::from_millis(url.bytes().fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(b as u64)) % 900);
+        let mut wait = Duration::from_millis(1200) + stagger;
+        loop {
+            match super::send(self, timeout, || self.ctx.client.get(&url)).await {
+                Ok(resp) => return resp.text().await.map_err(archive_error),
+                Err(e) if e.to_string().contains("429") && started.elapsed() + wait < timeout => {
+                    tokio::time::sleep(wait).await;
+                    wait *= 2;
+                }
+                Err(e) => return Err(archive_error(e)),
+            }
+        }
     }
 
     /// The archive's post and comment tree, at once.
@@ -1505,6 +1626,158 @@ pub async fn login_subreddit_search(
     login_page(&url, count).await.map(|(list, _)| list)
 }
 
+/// A comment-search hit on Reddit's search page (one result unit).
+const COMMENT_UNIT: &str = r#"view-events="search/view/comment""#;
+/// Reddit's own "no results" unit on a search page.
+const NO_RESULTS_UNIT: &str = r#"view-events="search/view/no_results""#;
+
+/// Reddit's comment search with the saved login (the search page's
+/// fragment, as the site loads it): threads whose answer is in a reply.
+/// Reddit applies a time window to comment search only when it is sorted
+/// by date, so `freshness` sorts by new; without it, by relevance.
+pub async fn login_comment_search(
+    query: &str,
+    count: usize,
+    freshness: Option<&str>,
+) -> Result<Vec<SearchResult>, String> {
+    let q: String = url::form_urlencoded::byte_serialize(query.as_bytes()).collect();
+    let order = match freshness {
+        Some(_) => format!("sort=new&t={}", window(freshness, "all")),
+        None => "sort=relevance&t=all".to_string(),
+    };
+    let url = format!("{LIVE}/svc/shreddit/search/?q={q}&type=comments&{order}");
+    let mut last = String::new();
+    for via in ["direct", "stealth"] {
+        acquire(Duration::from_secs(12)).await?;
+        let started = std::time::Instant::now();
+        let page = login_get(&url, via).await;
+        if let Ok((status, body)) = &page {
+            let account = format!("account: {}", crate::cookies::current_account());
+            crate::run::raw::record_page_as("reddit-login-comments", &url, *status, started.elapsed(), body, Some(account));
+        }
+        match page {
+            Ok((status, body)) if (200..300).contains(&status) => {
+                if body.contains(COMMENT_UNIT) {
+                    let hits = parse_comment_search(&body, count);
+                    if !hits.is_empty() {
+                        return Ok(hits);
+                    }
+                    last = format!("{via}: Reddit's comment results no longer parse");
+                } else if body.contains(NO_RESULTS_UNIT) {
+                    return Ok(Vec::new());
+                } else {
+                    last = format!("{via}: not a comment search page (the login may have lapsed)");
+                }
+            }
+            Ok((status, _)) => last = format!("{via}: HTTP {status}"),
+            Err(e) => last = format!("{via}: {e}"),
+        }
+    }
+    Err(last)
+}
+
+/// Threads of Reddit's comment-search page. Each result unit's tracker
+/// carries its thread (id, title, subreddit) as JSON; the reply's text and
+/// date follow in the unit. Adult and quarantined communities are dropped.
+pub fn parse_comment_search(html: &str, count: usize) -> Vec<SearchResult> {
+    static TAG: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"<search-telemetry-tracker\b[^>]*>").expect("regex"));
+    static CONTEXT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"\bdata-faceplate-tracking-context="([^"]*)""#).expect("regex")
+    });
+    static TIMEAGO: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"<faceplate-timeago\b[^>]*?\bts="([^"]+)""#).expect("regex")
+    });
+    static TAGS: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"<[^>]+>").expect("regex"));
+    let units: Vec<(usize, serde_json::Value)> = TAG
+        .find_iter(html)
+        .filter(|m| m.as_str().contains(COMMENT_UNIT))
+        .filter_map(|m| {
+            let c = CONTEXT.captures(m.as_str())?;
+            let v: serde_json::Value = serde_json::from_str(&unescape(&c[1])).ok()?;
+            Some((m.start(), v))
+        })
+        .collect();
+    let text = |v: &serde_json::Value| v.as_str().unwrap_or("").to_string();
+    let mut out: Vec<SearchResult> = Vec::new();
+    for (i, (start, ctx)) in units.iter().enumerate() {
+        let (post, sub, comment) = (&ctx["post"], &ctx["subreddit"], &ctx["comment"]);
+        if post["nsfw"].as_bool() == Some(true)
+            || sub["nsfw"].as_bool() == Some(true)
+            || sub["quarantined"].as_bool() == Some(true)
+        {
+            continue;
+        }
+        let mut post_id = text(&post["id"]).trim_start_matches("t3_").to_ascii_lowercase();
+        if post_id.is_empty() {
+            post_id = text(&comment["post_id"]).trim_start_matches("t3_").to_ascii_lowercase();
+        }
+        let name = text(&sub["name"]);
+        if !valid_id(&post_id) || !valid_sub(&name) {
+            continue;
+        }
+        let url = format!("{LIVE}/r/{name}/comments/{post_id}/");
+        if out.iter().any(|r| r.url == url) {
+            continue;
+        }
+        let end = units.get(i + 1).map_or(html.len(), |u| u.0);
+        let chunk = &html[*start..end];
+        let cid = text(&comment["id"]).trim_start_matches("t1_").to_ascii_lowercase();
+        let reply = chunk
+            .find(&format!("id=\"search-comment-t1_{cid}-post-rtjson-content\""))
+            .map(|at| {
+                let from = chunk[at..].find('>').map_or(chunk.len(), |g| at + g + 1);
+                let to = chunk[from..].find("</shreddit-stop-propagation>").map_or(chunk.len(), |e| from + e);
+                let plain = unescape(&TAGS.replace_all(&chunk[from..to], " "));
+                plain.split_whitespace().collect::<Vec<_>>().join(" ")
+            })
+            .unwrap_or_default();
+        let date = chunk
+            .find("data-testid=\"search-comment-content\"")
+            .and_then(|at| TIMEAGO.captures(&chunk[at..]))
+            .map(|c| c[1].chars().take(10).collect::<String>());
+        let title = match text(&post["title"]) {
+            t if t.trim().is_empty() => format!("r/{name} thread {post_id}"),
+            t => unescape(t.trim()),
+        };
+        out.push(SearchResult {
+            title,
+            url,
+            snippet: format!("r/{name} · a reply: {}", thread::clip(&reply, 300)),
+            source: "reddit".into(),
+            published: date,
+            image_url: None,
+            extra: Some(serde_json::json!({ "subreddit": name, "route": "login-comments" })),
+        });
+        if out.len() >= count {
+            break;
+        }
+    }
+    out
+}
+
+/// One page through the saved login: the plain fetcher, or the
+/// browser-like one. (status, body)
+async fn login_get(url: &str, via: &str) -> Result<(u16, String), String> {
+    match via {
+        "direct" => match crate::page::client() {
+            Ok(client) => crate::page::fetch_direct_with(&client, url, Duration::from_secs(10), true)
+                .await
+                .map(|p| (p.status, p.body))
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        },
+        #[cfg(feature = "stealth")]
+        _ => crate::providers::stealth::fetch_page(url, Duration::from_secs(10), true)
+            .await
+            .map(|p| (p.status, p.body))
+            .map_err(|e| e.to_string()),
+        #[cfg(not(feature = "stealth"))]
+        _ => Err("stealth fetcher not built".to_string()),
+    }
+}
+
 /// One old-Reddit search page through the saved login, paced with every
 /// other Reddit request: its threads and the next page's address.
 async fn login_page(
@@ -1520,39 +1793,26 @@ async fn login_page(
         let started = std::time::Instant::now();
         // The raw page, converted whole: article extraction can keep one
         // result's post text and drop the list of results.
-        let page = match via {
-            "direct" => match crate::page::client() {
-                Ok(client) => crate::page::fetch_direct_with(&client, url, Duration::from_secs(10), true)
-                    .await
-                    .map_err(|e| e.to_string()),
-                Err(e) => Err(e.to_string()),
-            },
-            #[cfg(feature = "stealth")]
-            _ => crate::providers::stealth::fetch_page(url, Duration::from_secs(10), true)
-                .await
-                .map_err(|e| e.to_string()),
-            #[cfg(not(feature = "stealth"))]
-            _ => Err("stealth fetcher not built".to_string()),
-        };
-        if let Ok(p) = &page {
+        let page = login_get(url, via).await;
+        if let Ok((status, body)) = &page {
             let account = format!("account: {}", crate::cookies::current_account());
-            crate::run::raw::record_page_as("reddit-login-search", url, p.status, started.elapsed(), &p.body, Some(account));
+            crate::run::raw::record_page_as("reddit-login-search", url, *status, started.elapsed(), body, Some(account));
         }
         match page {
-            Ok(p) if (200..300).contains(&p.status) => {
-                let (_, md) = crate::page::whole_page_markdown(&p.body, url);
+            Ok((status, body)) if (200..300).contains(&status) => {
+                let (_, md) = crate::page::whole_page_markdown(&body, url);
                 let results = parse_login_search(&md, count);
                 if !results.is_empty() {
                     let next = NEXT.captures(&md).map(|c| c[1].replace("&amp;", "&"));
                     return Ok((results, next));
                 }
                 // A logged-in page that lists nothing is an empty result, not a failed login.
-                if p.body.to_ascii_lowercase().contains("logout") {
+                if body.to_ascii_lowercase().contains("logout") {
                     return Ok((Vec::new(), None));
                 }
                 last = format!("{via}: no threads on the page");
             }
-            Ok(p) => last = format!("{via}: HTTP {}", p.status),
+            Ok((status, _)) => last = format!("{via}: HTTP {status}"),
             Err(e) => last = format!("{via}: {e}"),
         }
     }
@@ -1757,15 +2017,16 @@ mod tests {
 
     #[test]
     fn the_bucket_allows_a_burst_then_about_ten_a_minute() {
+        const TEN: f64 = 10.0 / 60.0;
         let mut b = Bucket::full(1000.0);
         for _ in 0..5 {
-            assert!(b.take(1000.0).is_ok());
+            assert!(b.take(1000.0, TEN).is_ok());
         }
-        let wait = b.take(1000.0).unwrap_err();
+        let wait = b.take(1000.0, TEN).unwrap_err();
         assert!((5.5..=6.5).contains(&wait.as_secs_f64()), "{wait:?}");
         // Six seconds later one more token is free, and only one.
-        assert!(b.take(1006.1).is_ok());
-        assert!(b.take(1006.2).is_err());
+        assert!(b.take(1006.1, TEN).is_ok());
+        assert!(b.take(1006.2, TEN).is_err());
         // A minute of quiet refills about ten, capped at the burst.
         let mut taken = 0;
         let mut b = Bucket {
@@ -1775,7 +2036,7 @@ mod tests {
         };
         let mut t = 0.0;
         while t < 60.0 {
-            if b.take(t).is_ok() {
+            if b.take(t, TEN).is_ok() {
                 taken += 1;
             }
             t += 0.5;

@@ -55,8 +55,10 @@ fn request(client: &reqwest::Client, key: &str, call: &Call<'_>) -> reqwest::Req
     let fresh = call.opts.freshness.as_deref();
     if call.mode == Mode::Forums {
         let mut q = vec![("engine", "google_forums".to_string()), ("q", call.query.to_string()), ("api_key", key.to_string())];
+        // SerpApi refuses a unit without its count ("Missing `period_value`").
         if let Some(unit) = fresh.and_then(period_unit) {
             q.push(("period_unit", unit.to_string()));
+            q.push(("period_value", "1".to_string()));
         }
         return client.get("https://serpapi.com/search").query(&q);
     }

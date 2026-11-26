@@ -23,7 +23,8 @@ export default function EnginesPage() {
   if (engines.isError || !engines.data) return <ErrorBox error={engines.error} onRetry={() => engines.refetch()} />;
   const bal = new Map(engines.data.balances.map((b) => [b.service, b]));
   const spend = stats.data?.by_provider ?? {};
-  const list = [...engines.data.engines].sort((a, b) => Number(b.configured) - Number(a.configured) || a.name.localeCompare(b.name));
+  // Engines with an allowance first, then the rest; each group by name.
+  const list = [...engines.data.engines].sort((a, b) => Number(bal.has(b.balance)) - Number(bal.has(a.balance)) || a.name.localeCompare(b.name));
 
   return (
     <>
@@ -54,7 +55,8 @@ export default function EnginesPage() {
             </thead>
             <tbody>
               {list.map((e) => {
-                const b = bal.get(e.name);
+                const b = bal.get(e.balance);
+                const shared = b && e.balance !== e.name;
                 const s = spend[e.name];
                 return (
                   <tr key={e.name} className={cn("border-b border-line last:border-0", !e.configured && "text-muted")}>
@@ -64,7 +66,16 @@ export default function EnginesPage() {
                       {e.optional && <Badge className="ml-1">only when named</Badge>}
                     </td>
                     <td className="px-3 py-2 text-right tabular">{e.per_call_usd ? usd(e.per_call_usd) : "free"}</td>
-                    <td className="px-3 py-2">{b ? <BalanceBar b={b} /> : <span className="text-xs text-muted">{e.per_call_usd ? "no allowance set (used freely)" : "–"}</span>}</td>
+                    <td className="px-3 py-2">
+                      {b ? (
+                        <>
+                          <BalanceBar b={b} />
+                          {shared && <div className="mt-0.5 text-[11px] text-muted">shared {b.service} allowance</div>}
+                        </>
+                      ) : (
+                        <span className="text-xs text-muted">{e.per_call_usd ? "no allowance set (used freely)" : "–"}</span>
+                      )}
+                    </td>
                     <td className="px-3 py-2 text-right tabular">{s ? usd(s.estimated_spend_usd) : "–"}</td>
                     <td className="px-3 py-2 text-xs text-muted">{e.modes.join(", ")}</td>
                   </tr>

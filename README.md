@@ -16,7 +16,7 @@ An agent doing research usually juggles several search tools, guesses which one 
 - **Where people actually talk.** Community questions also search Reddit (several routes, with or without a login), forums (Google's forum filter, Discourse forums directly, GitHub Discussions, Lemmy), Telegram channels and Hacker News. Social mode adds YouTube captions, X, Bluesky and more.
 - **Pages, not snippets.** The best pages are read through tiers: a site's own API first, a fast fetcher, a browser only when needed, hosted readers last, and the Wayback Machine for pages that are gone or walled. Each page is saved with an outline, so an agent reads one section instead of the whole page.
 - **Everything kept.** Every engine's raw answer, every page, why each page was picked and how it was fetched. Runs can be continued, searched, re-ranked and compared later.
-- **An answer you can check.** An optional AI synthesis writes a cited answer from the pages, and every quote in it is checked word for word against the page it cites.
+- **An answer you can check.** An optional AI synthesis writes a cited answer from the pages, one per round of follow-up searches, and every quote in it is checked word for word against the page it cites. What each synthesis was sent and what it cost is saved beside it.
 - **Costs under control.** Each engine's allowance (monthly, one-time or expiring credits) steers which engines run, and spend is logged per call.
 
 ## Status
@@ -101,7 +101,7 @@ Modes (`-m`): general, community, forums, social, news, code, academic, scholar,
 
 Some features act as you, through your own logins. They are off or opt-in for a reason:
 
-- **Logged-in Reddit search** uses your saved Reddit login (`osearch login reddit.com`, or `--as <name>` for a second account). Heavy automated use can get an account limited; a spare account for runs (`research.redditaccount`) is the safer setup. Without any login, Reddit refuses most requests from some addresses, so community search is weaker.
+- **Logged-in Reddit search** uses your saved Reddit login (`osearch login reddit.com`, or `--as <name>` for a second account). Heavy automated use can get an account limited; a spare account for runs (`research.redditaccount`) is the safer setup. Logged-in requests are paced (`research.redditpace`, a minute per account); `research.redditsidebyside` (off by default) runs the spare and main logins at once, which is faster but sends more requests from one address. Without any login, Reddit refuses most requests from some addresses, so community search is weaker.
 - **X search** (`research.xbird`, off by default) runs as your real X account.
 - **Saved logins** are stored encrypted for your Windows user on Windows, and as a file readable only by you on Linux and macOS.
 - **The stealth fetcher** imitates a browser's network fingerprint to get past refusals. Respect the sites you read.
@@ -124,4 +124,6 @@ osearch began as a copy of [search-cli](https://github.com/paperfoot/search-cli)
 
 ## Licence
 
-To be decided before the first public release. The parts taken from other projects keep their own licences (see NOTICE.md).
+OmniSearch CLI is free software under the [GNU Affero General Public License v3.0 only](LICENSE) (AGPL-3.0-only). Copyright (C) 2026 Anshul Jain.
+
+You may use, change and share it. If you share a changed version, or run one as a service for other people, its source goes with it under the same licence. The parts taken from other projects keep their own licences: [NOTICE.md](NOTICE.md) lists them, and their licence texts are in [licenses/](licenses/).

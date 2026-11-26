@@ -6,6 +6,7 @@ import DataTable from "@/components/DataTable";
 import { Badge, Card, CardHead, ErrorBox, Loading, PageHeader, Stat } from "@/components/ui";
 import { get } from "@/lib/api";
 import { ms, num, pct, runTime, tokens } from "@/lib/format";
+import { useDark } from "@/lib/theme";
 import type { EngineNums, FetcherNums, Insights } from "@/lib/types";
 import { WHY_LABEL, WHY_TONE } from "./run/data";
 
@@ -33,7 +34,7 @@ const fetcherCols: ColumnDef<FetcherRow, unknown>[] = [
 
 export default function InsightsPage() {
   const q = useQuery({ queryKey: ["insights"], queryFn: () => get<Insights>("/insights"), staleTime: 120_000 });
-  const dark = document.documentElement.classList.contains("dark");
+  const dark = useDark();
   const engines = useMemo(() => Object.entries(q.data?.engines ?? {}).map(([name, e]) => ({ name, ...e })).filter((e) => e.links || e.calls), [q.data]);
   const fetchers = useMemo(() => Object.entries(q.data?.fetchers ?? {}).map(([name, f]) => ({ name, ...f })), [q.data]);
   const runs = q.data?.runs ?? [];
@@ -42,7 +43,8 @@ export default function InsightsPage() {
     for (const r of runs) {
       const d = runTime(r.id);
       if (!d) continue;
-      const k = d.toISOString().slice(0, 10);
+      // Local date (run ids are local time); toISOString would shift early runs a day back.
+      const k = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
       m.set(k, (m.get(k) ?? 0) + 1);
     }
     return [...m.entries()].sort();

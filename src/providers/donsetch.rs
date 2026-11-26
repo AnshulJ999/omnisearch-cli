@@ -41,6 +41,21 @@ fn intent(mode: Mode) -> &'static str {
     }
 }
 
+/// donsetch's keyless Exa and Parallel sources, switched off when osearch
+/// asks those engines itself: one engine's answer reached two ways would
+/// otherwise count as two engines agreeing.
+fn own_engine_overlap() -> Vec<(&'static str, &'static str)> {
+    let config = crate::config::get();
+    let mut env = Vec::new();
+    if !super::key_for(config, &super::exa::SPEC).is_empty() {
+        env.push(("DONSETCH_SEARCH__EXA_MCP", "false"));
+    }
+    if !super::key_for(config, &super::parallel::SPEC).is_empty() {
+        env.push(("DONSETCH_SEARCH__PARALLEL_MCP", "false"));
+    }
+    env
+}
+
 fn fail(category: FailureCategory, message: String) -> SearchError {
     SearchError::Upstream {
         provider: "donsetch",
@@ -110,7 +125,7 @@ impl Adapter for Donsetch {
             "--deadline-ms".into(),
             deadline_ms.saturating_sub(500).max(500).to_string(),
         ];
-        let ran = tools::run(Tool::Donsetch, &args, call.timeout + Duration::from_secs(2))
+        let ran = tools::run_env(Tool::Donsetch, &args, call.timeout + Duration::from_secs(2), &own_engine_overlap())
             .await
             .map_err(|e| fail(FailureCategory::Config, e))?;
         if ran.timed_out {

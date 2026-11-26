@@ -196,6 +196,9 @@ pub fn runs(find: Option<&str>, limit: usize) -> String {
     let mut lines = run::all_runs();
     lines.extend(run::unfinished_runs(&lines));
     lines.sort_by(|a, b| a.id.cmp(&b.id).then(a.round.cmp(&b.round)));
+    if let Some(found) = find.and_then(|f| by_meaning(f, &lines, limit)) {
+        return found;
+    }
     let terms = find.map(outline::terms).unwrap_or_default();
     let mut picked: Vec<&run::RunLine> = lines.iter().rev().collect();
     let mut loose = false;
@@ -255,4 +258,73 @@ pub fn runs(find: Option<&str>, limit: usize) -> String {
     }
     out.push_str(&format!("archive: {}\n", run::runs_root().display()));
     out
+}
+
+/// Past runs found by meaning as well as words, through `ctx` (a local
+/// search tool over the runs folder) when it is installed and answers;
+/// None falls back to word matching.
+fn by_meaning(find: &str, lines: &[run::RunLine], limit: usize) -> Option<String> {
+    let v = ctx_search(find)?;
+    let root = run::runs_root().to_string_lossy().replace('\\', "/").to_lowercase();
+    let mut out = String::new();
+    let mut seen: Vec<String> = Vec::new();
+    for r in v["results"].as_array()? {
+        let path = r["path"].as_str().unwrap_or("").replace('\\', "/");
+        let Some(rest) = path.to_lowercase().strip_prefix(&format!("{root}/")).map(|_| &path[root.len() + 1..]) else { continue };
+        let id = rest.split('/').next().unwrap_or("").to_string();
+        if id.is_empty() || seen.contains(&id) {
+            continue;
+        }
+        let Some(l) = lines.iter().filter(|l| l.id == id).max_by_key(|l| l.round) else { continue };
+        let hint = r["lines"].as_array().and_then(|a| a.first()).and_then(|x| x.as_str()).unwrap_or("").trim();
+        out.push_str(&format!(
+            "{} r{} [{}] {} · {} pages\n    {}: {}\n",
+            l.id,
+            l.round,
+            l.kind,
+            crate::providers::thread::clip(&l.topic, 80),
+            l.pages,
+            rest.split_once('/').map_or("", |(_, f)| f),
+            crate::providers::thread::clip(hint, 140)
+        ));
+        seen.push(id);
+        if seen.len() >= limit {
+            break;
+        }
+    }
+    if seen.is_empty() {
+        return None;
+    }
+    Some(format!("Past runs matching '{find}' by meaning and words (ctx), best first:\n{out}archive: {}\n", run::runs_root().display()))
+}
+
+/// `ctx "<question>" -b runs --json`, or None when it is missing, slow or fails.
+fn ctx_search(find: &str) -> Option<serde_json::Value> {
+    let exe = if cfg!(windows) { "ctx.cmd" } else { "ctx" };
+    let mut child = std::process::Command::new(exe)
+        .args([find, "-b", "runs", "-n", "40", "--json"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = std::io::Read::read_to_string(&mut stdout, &mut buf);
+        buf
+    });
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(Some(_)) | Err(_) => return None,
+            Ok(None) if started.elapsed() > std::time::Duration::from_secs(45) => {
+                let _ = child.kill();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
+        }
+    }
+    serde_json::from_str(&reader.join().ok()?).ok()
 }

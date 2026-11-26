@@ -216,6 +216,13 @@ impl Brave {
         if let Some(t) = *last {
             tokio::time::sleep_until((t + TURN_GAP).into()).await;
         }
+        // Other osearch processes (agents running searches side by side)
+        // take their turns from the same file.
+        let turn = shared_turn();
+        if turn >= call.timeout.saturating_sub(started.elapsed()) {
+            return Err(not_sent());
+        }
+        tokio::time::sleep(turn).await;
         let left = call.timeout.saturating_sub(started.elapsed());
         if left.is_zero() {
             return Err(not_sent());
@@ -229,6 +236,25 @@ impl Brave {
 
 static LAST_ANSWER: tokio::sync::Mutex<Option<std::time::Instant>> = tokio::sync::Mutex::const_new(None);
 const TURN_GAP: std::time::Duration = std::time::Duration::from_millis(1050);
+
+/// Brave's next free moment across osearch processes, kept in a file in the
+/// cache: this call takes it and moves it on by the gap. How long to wait.
+fn shared_turn() -> std::time::Duration {
+    static FILE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = FILE.lock().unwrap_or_else(|e| e.into_inner());
+    let path = crate::cache::cache_dir().join("brave-turn.txt");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    let next: f64 = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0.0);
+    let at = next.max(now);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&path, format!("{}", at + TURN_GAP.as_secs_f64()));
+    std::time::Duration::from_secs_f64(at - now)
+}
 
 /// Both deep halves failed: report a billed half's error when there is one,
 /// so the engine books the spend instead of pricing the call at 0.

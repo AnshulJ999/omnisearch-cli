@@ -73,7 +73,8 @@ fn json_file(path: &Path) -> Value {
 }
 
 pub(super) fn jsonl(path: &Path) -> Vec<Value> {
-    text(path)
+    crate::run::read_text(path)
+        .ok()
         .map(|t| t.lines().filter_map(|l| serde_json::from_str(l).ok()).collect())
         .unwrap_or_default()
 }
@@ -114,9 +115,14 @@ async fn config() -> Answer {
     if let Some(k) = v.pointer_mut("/synth/key") {
         *k = json!(crate::config::mask_key(k.as_str().unwrap_or("")));
     }
+    let mut defaults = serde_json::to_value(crate::config::AppConfig::default()).map_err(|e| bad(e.to_string()))?;
+    if let Some(k) = defaults.pointer_mut("/synth/key") {
+        *k = json!("");
+    }
     Ok(Json(json!({
         "path": crate::config::config_path(),
         "values": v,
+        "defaults": defaults,
         "settings": super::settings::SETTINGS,
     })))
 }
@@ -130,6 +136,13 @@ struct SetBody {
 async fn set_config(Json(body): Json<SetBody>) -> Answer {
     if !super::settings::SETTINGS.iter().any(|s| s.key == body.key) {
         return Err(bad(format!("{} is not a setting the UI changes", body.key)));
+    }
+    // A secret is never shown, so its masked form coming back is not a new value.
+    if body.key == "synth.key" {
+        let current = crate::config::get().synth.key.clone();
+        if body.value.trim().is_empty() || body.value == crate::config::mask_key(&current) || body.value == "(not set)" {
+            return Err(bad("paste a new key to change it; the saved one stays as it is"));
+        }
     }
     crate::config::config_set(&body.key, &body.value).map_err(|e| bad(e.to_string()))?;
     config().await
@@ -192,12 +205,27 @@ async fn run(UrlPath(id): UrlPath<String>) -> Answer {
         .filter(|l| l.id == id)
         .filter_map(|l| serde_json::to_value(l).ok())
         .collect();
+    // Each round's synthesis and the whole-run one, with what each was sent.
+    let mut syntheses: Vec<Value> = Vec::new();
+    let tags = (1..=rounds.len()).map(|n| (format!("r{n}"), format!("Round {n}"))).chain([("all".to_string(), "Whole run".to_string())]);
+    for (tag, label) in tags {
+        let file = dir.join(format!("synthesis.{tag}.md"));
+        if file.is_file() {
+            syntheses.push(json!({
+                "tag": tag,
+                "label": label,
+                "text": text(&file),
+                "figures": json_file(&dir.join(format!("synthesis.{tag}.json"))),
+            }));
+        }
+    }
     Ok(Json(json!({
         "id": id,
         "rounds": rounds,
         "index": index,
         "summary": text(&dir.join("summary.md")),
         "synthesis": text(&dir.join("synthesis.md")),
+        "syntheses": syntheses,
         "synthesis_running": dir.join(crate::synth::RUNNING).exists(),
         "jina_running": dir.join("jina-deepsearch.running").exists(),
         "pages": crate::run::load_pages(&dir),
@@ -238,7 +266,9 @@ async fn page(UrlPath((id, pid)): UrlPath<(String, String)>) -> Answer {
 async fn raw(UrlPath((id, file)): UrlPath<(String, String)>) -> Answer {
     let dir = run_dir(&id)?;
     let path = dir.join("raw").join(plain(&file)?);
-    let body = std::fs::read(&path).map_err(|_| missing(format!("no raw file {file}")))?;
+    let body = std::fs::read(&path)
+        .or_else(|_| crate::run::read_text(&path).map(String::into_bytes))
+        .map_err(|_| missing(format!("no raw file {file}")))?;
     let cap = 2_000_000;
     let cut = body.len() > cap;
     let text = String::from_utf8_lossy(&body[..body.len().min(cap)]).into_owned();
@@ -275,6 +305,8 @@ async fn engines(State(state): State<Arc<UiState>>) -> Json<Value> {
                 "per_call_usd": s.price.per_call as f64 / 1e6,
                 "modes": p.capabilities(),
                 "optional": crate::providers::SOCIAL_PLATFORMS.contains(&s.name),
+                // The ScrapeCreators platforms draw on one shared balance.
+                "balance": if crate::providers::social_api::PLATFORMS.contains(&s.name) { "scrapecreators" } else { s.name },
             })
         })
         .collect();

@@ -74,7 +74,7 @@ pub async fn start(State(state): State<Arc<UiState>>, Json(body): Json<Start>) -
             (a, q)
         }
         "synth" => {
-            let id = body.run.ok_or_else(|| bad("synthesis needs a run"))?;
+            let id = body.run.clone().ok_or_else(|| bad("synthesis needs a run"))?;
             super::api::run_dir(&id)?;
             (vec!["synth".into(), id.clone()], format!("synthesis of {id}"))
         }
@@ -90,7 +90,8 @@ pub async fn start(State(state): State<Arc<UiState>>, Json(body): Json<Start>) -
         ended: None,
         code: None,
         lines: Vec::new(),
-        run: None,
+        // Known up front for a synthesis or a follow-up round.
+        run: body.run.clone(),
         pid: None,
     }));
     state.jobs.inner.lock().expect("jobs").insert(id, job.clone());
@@ -102,6 +103,12 @@ pub async fn start(State(state): State<Arc<UiState>>, Json(body): Json<Start>) -
         .stderr(std::process::Stdio::piped())
         .env("NO_COLOR", "1")
         .kill_on_drop(false);
+    #[cfg(windows)]
+    {
+        // No console window per job when the UI runs without one.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
     let mut child = cmd.spawn().map_err(|e| bad(&format!("could not start osearch: {e}")))?;
     job.lock().expect("job").pid = child.id();
     let (out, err) = (child.stdout.take(), child.stderr.take());
@@ -153,7 +160,8 @@ fn run_since(stamp: &str) -> Option<String> {
 }
 
 fn view(j: &Job, with_lines: bool) -> Value {
-    let run = j.run.clone().or_else(|| (j.kind == "run").then(|| run_since(&j.stamp)).flatten());
+    // The folder guess only while a new run has not printed its id yet.
+    let run = j.run.clone().or_else(|| (j.kind == "run" && j.ended.is_none()).then(|| run_since(&j.stamp)).flatten());
     let mut progress = json!(null);
     if let Some(id) = &run {
         let dir = crate::run::runs_root().join(id);

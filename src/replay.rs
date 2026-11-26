@@ -14,7 +14,7 @@ const RERANK: usize = 100;
 pub async fn command(app: &AppContext, which: Option<String>, top: usize) -> Result<i32, SearchError> {
     let dir = crate::run::resolve(which.as_deref().unwrap_or("last"))?;
     let id = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let rows: Vec<Value> = std::fs::read_to_string(dir.join("results.jsonl"))?
+    let rows: Vec<Value> = crate::run::read_text(&dir.join("results.jsonl"))?
         .lines()
         .filter_map(|l| serde_json::from_str(l).ok())
         .filter(|v: &Value| v["engines"].as_array().is_none_or(|e| !e.iter().any(|x| x == "jina-deepsearch")))

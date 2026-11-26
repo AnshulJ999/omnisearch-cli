@@ -488,6 +488,38 @@ pub struct Research {
     /// searches; off, their posts compete by rank only.
     #[serde(default)]
     pub telegramslot: bool,
+    /// `osearch runs --compress` compresses the raw engine answers and the
+    /// results index of runs older than this many days; 0 leaves runs as they are.
+    #[serde(default)]
+    pub compressafter: u64,
+    /// Logged-in Reddit requests a minute per account, shared by every
+    /// osearch process (a short burst of a few is allowed).
+    #[serde(default = "default_reddit_pace")]
+    pub redditpace: u64,
+    /// Logged-in Reddit searches shared between the run account and the
+    /// main login at the same time, each at its own pace; the main login's
+    /// share counts against `redditmainmax`.
+    #[serde(default)]
+    pub redditsidebyside: bool,
+    /// Logged-in comment search beside the post search of a community
+    /// question: threads whose answer is in a reply.
+    #[serde(default = "default_true")]
+    pub redditcomments: bool,
+    /// Subreddits searched inside per community question.
+    #[serde(default = "default_reddit_subs")]
+    pub redditsubs: usize,
+    /// Hours every run skips a Reddit route that refused us (HTTP 403);
+    /// 0 tries it on every run.
+    #[serde(default = "default_reddit_refused")]
+    pub redditrefused: u64,
+    /// Dates of found Reddit threads that came without one, filled in from
+    /// the archive (one call per 100 threads).
+    #[serde(default = "default_true")]
+    pub redditfill: bool,
+    /// The GitHub list beside a question: all (general, community and deep
+    /// questions), general (general and deep only), off.
+    #[serde(default = "default_github_beside")]
+    pub githubbeside: String,
     /// Characters of a result's snippet in the summary's top results.
     #[serde(default = "default_snippet_chars")]
     pub snippetchars: usize,
@@ -534,6 +566,14 @@ impl Default for Research {
             fetchfloor: true,
             forumboth: true,
             telegramslot: false,
+            compressafter: 0,
+            redditpace: default_reddit_pace(),
+            redditsidebyside: false,
+            redditcomments: true,
+            redditsubs: default_reddit_subs(),
+            redditrefused: default_reddit_refused(),
+            redditfill: true,
+            githubbeside: default_github_beside(),
             snippetchars: default_snippet_chars(),
             topresults: default_top_results(),
             snippetprefer: default_snippet_prefer(),
@@ -567,6 +607,22 @@ fn default_reddit_live_max() -> usize {
 }
 fn default_reddit_main_max() -> usize {
     8
+}
+
+fn default_reddit_pace() -> u64 {
+    30
+}
+
+fn default_reddit_subs() -> usize {
+    4
+}
+
+fn default_reddit_refused() -> u64 {
+    6
+}
+
+fn default_github_beside() -> String {
+    "all".into()
 }
 fn default_dedupe_min() -> u64 {
     80
@@ -773,6 +829,11 @@ pub fn config_show(config: &AppConfig) {
     );
     println!("  forumboth   {} (forum threads: donsetch and the built-in fetchers together, the longer copy kept)", if r.forumboth { "on" } else { "off" });
     println!("  telegramslot {} (Telegram side searches get a guaranteed page; off: by rank only)", if r.telegramslot { "on" } else { "off" });
+    if r.compressafter > 0 {
+        println!("  compress    runs older than {} days (`osearch runs --compress`)", r.compressafter);
+    } else {
+        println!("  compress    off (research.compressafter 0)");
+    }
     println!("  snippets    {} chars, {} top results in the summary · preferred: {}", r.snippetchars, r.topresults, r.snippetprefer.join(", "));
     println!("  concurrency {}", r.concurrency);
     println!("  snowball    {}", r.snowball);
@@ -799,6 +860,19 @@ pub fn config_show(config: &AppConfig) {
     let threshold = if r.redditlogin == "auto" { format!(" (when fewer than {} threads)", r.redditmin) } else { String::new() };
     println!("  redditlogin {}{threshold} · account {}", r.redditlogin, if r.redditaccount.is_empty() { "main" } else { &r.redditaccount });
     println!("  redditlivemax {} (live reads of picked threads per run) · redditmainmax {} (main-login calls per run when the run account fails)", r.redditlivemax, r.redditmainmax);
+    println!(
+        "  redditpace  {} a minute per account · side by side {} · comment search {} · subreddits {} per question",
+        r.redditpace,
+        if r.redditsidebyside { "on" } else { "off" },
+        if r.redditcomments { "on" } else { "off" },
+        r.redditsubs
+    );
+    println!(
+        "  redditrefused {} h (a route Reddit refused is skipped for this long; 0 = try every run) · redditfill {} (thread dates from the archive)",
+        r.redditrefused,
+        if r.redditfill { "on" } else { "off" }
+    );
+    println!("  githubbeside {} (the GitHub list beside questions: all, general, off)", r.githubbeside);
     println!("  dedupe      {} (leave near-copies, {}% the same, out of synthesis; the overlap is recorded either way)", if r.dedupe { "on" } else { "off" }, r.dedupemin);
     println!("  redditlive  {} (Reddit's own pages without a login)", if r.redditlive { "on" } else { "off" });
     println!("  redditarchive {} (the archive's subreddit title search)", if r.redditarchive { "on" } else { "off" });
@@ -884,7 +958,12 @@ pub fn config_set(key: &str, value: &str) -> Result<(), SearchError> {
                 _ => return Err(SearchError::Config(format!("{key} must be auto, always or never"))),
             },
             "redditaccount" => toml::Value::String(value.to_string()),
-            "redditlive" | "redditarchive" | "xbird" | "rerank" | "dedupe" | "fetchfloor" | "forumboth" | "telegramslot" => match value {
+            "githubbeside" => match value {
+                "all" | "general" | "off" => toml::Value::String(value.to_string()),
+                _ => return Err(SearchError::Config(format!("{key} must be all, general or off"))),
+            },
+            "redditlive" | "redditarchive" | "xbird" | "rerank" | "dedupe" | "fetchfloor" | "forumboth" | "telegramslot"
+            | "redditsidebyside" | "redditcomments" | "redditfill" => match value {
                 "true" | "on" | "yes" => toml::Value::Boolean(true),
                 "false" | "off" | "no" => toml::Value::Boolean(false),
                 _ => return Err(SearchError::Config(format!("{key} must be true or false"))),
@@ -892,7 +971,7 @@ pub fn config_set(key: &str, value: &str) -> Result<(), SearchError> {
             "count" | "fetch" | "quickfetch" | "communityfetch" | "concurrency" | "snowball" | "fetchtime"
             | "quicktime" | "softtime" | "quicksoft" | "redditmin" | "githubminstars" | "deepfetch"
             | "redditlivemax" | "redditmainmax" | "dedupemin" | "fetchgrow" | "fetchmax" | "snippetchars"
-            | "topresults" => {
+            | "topresults" | "compressafter" | "redditpace" | "redditsubs" | "redditrefused" => {
                 toml::Value::Integer(value.parse::<i64>().map_err(|_| {
                     SearchError::Config(format!("{key} must be a whole number, got '{value}'"))
                 })?)
@@ -990,6 +1069,14 @@ pub fn config_set(key: &str, value: &str) -> Result<(), SearchError> {
             )))
         }
     }
+    // The edited file must still load (a negative count, a number out of
+    // range), or nothing is written.
+    let text = toml::to_string(&doc).map_err(|e| SearchError::Config(e.to_string()))?;
+    Figment::new()
+        .merge(Serialized::defaults(AppConfig::default()))
+        .merge(Toml::string(&text))
+        .extract::<AppConfig>()
+        .map_err(|e| SearchError::Config(format!("{key} = {value} is not a valid value: {e}")))?;
     write_doc(&path, &doc)
 }
 

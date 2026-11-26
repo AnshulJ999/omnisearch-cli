@@ -27,14 +27,20 @@ pub fn repo_of(url: &str) -> Option<(String, String)> {
     (!skip.contains(&owner.to_ascii_lowercase().as_str())).then(|| (owner, c[2].to_string()))
 }
 
-/// The GitHub side query of a general, community or deep question.
+/// The GitHub side query of a general, community or deep question
+/// (`research.githubbeside`).
 pub fn general(
     app: &Arc<AppContext>,
     req: &Request,
     statuses: &[crate::budget::Status],
     p: &Planned,
 ) -> Option<Planned> {
-    if !matches!(p.mode, Mode::General | Mode::Community | Mode::Deep) || tools::locate(Tool::Gh).is_none() {
+    let modes: &[Mode] = match crate::config::get().research.githubbeside.as_str() {
+        "off" => &[],
+        "general" => &[Mode::General, Mode::Deep],
+        _ => &[Mode::General, Mode::Community, Mode::Deep],
+    };
+    if !modes.contains(&p.mode) || tools::locate(Tool::Gh).is_none() {
         return None;
     }
     let words = carrying_words(&p.query, 4);

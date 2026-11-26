@@ -76,8 +76,9 @@ jobs:
           mkdir -p "dist/$name"
           exe=osearch; [ "${{ runner.os }}" = Windows ] && exe=osearch.exe
           cp "target/${{ matrix.target }}/release/$exe" "dist/$name/"
-          cp README.md LICENSE NOTICE.md config.example.toml "dist/$name/"
-          cp -r skill "dist/$name/"
+          cp README.md LICENSE NOTICE.md AGENTS.md config.example.toml "dist/$name/"
+          cp -r licenses "dist/$name/"
+          cp -r skill docs "dist/$name/"
           cd dist
           if [ "${{ matrix.archive }}" = zip ]; then
             7z a "$name.zip" "$name" > /dev/null

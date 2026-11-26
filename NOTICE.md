@@ -1,10 +1,10 @@
 # Credits and third-party notices
 
-osearch stands on other people's work. This file lists what it took or learned from each project, and the licence the borrowed parts keep.
+osearch stands on other people's work. This file lists what it took or learned from each project, and the licence the borrowed parts keep. osearch itself is under the GNU AGPL v3 ([LICENSE](LICENSE)); the licence texts of the projects below are in [licenses/](licenses/).
 
 ## Code taken in
 
-- **[search-cli](https://github.com/paperfoot/search-cli)** by Boris Djordjevic, 199 Biotechnologies and Paperfoot AI (MIT). osearch began as a copy of it (crate `agent-search` v0.12.1): the engines, rank fusion, cost per call, usage and stats, failure categories, page verdicts and the private-address guard come from there. Its copyright notice is in [LICENSE](LICENSE); what changed since is in [UPSTREAM.md](UPSTREAM.md).
+- **[search-cli](https://github.com/paperfoot/search-cli)** by Boris Djordjevic, 199 Biotechnologies and Paperfoot AI (MIT). osearch began as a copy of it (crate `agent-search` v0.12.1): the engines, rank fusion, cost per call, usage and stats, failure categories, page verdicts and the private-address guard come from there. Its copyright notice is in [licenses/search-cli-MIT.txt](licenses/search-cli-MIT.txt); what changed since is in [UPSTREAM.md](UPSTREAM.md).
 - **[fatsearch](https://github.com/fatsearch/fatsearch)** (Apache-2.0): the reading model (pages kept whole, read by outline and section), the token estimate in `src/outline.rs`, and the loss check in `src/fetch/convert.rs`.
 - **[last30days](https://github.com/mvanhorn/last30days-skill)** by mvanhorn (MIT): `src/relevance.rs` ports its relevance scoring; the Reddit RSS route, the YouTube caption order and the Telegram and Bluesky routes follow its sources.
 - **Bird** by Peter Steinberger (MIT), the X search client, vendored through last30days in `vendor/bird-search` with its licence; changed to ask X for top posts.

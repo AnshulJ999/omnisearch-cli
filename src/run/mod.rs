@@ -29,6 +29,78 @@ pub fn runs_root() -> PathBuf {
     archive_root().join("runs")
 }
 
+fn zst_path(path: &Path) -> PathBuf {
+    let mut p = path.as_os_str().to_owned();
+    p.push(".zst");
+    PathBuf::from(p)
+}
+
+/// A run file, or its compressed copy (`<name>.zst`) in a compressed run.
+pub fn read_text(path: &Path) -> std::io::Result<String> {
+    match std::fs::read_to_string(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let bytes = zstd::decode_all(std::fs::File::open(zst_path(path))?)?;
+            String::from_utf8(bytes).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        }
+        r => r,
+    }
+}
+
+/// What `osearch runs --compress` did.
+#[derive(Default)]
+pub struct Compressed {
+    pub runs: usize,
+    pub files: usize,
+    pub before: u64,
+    pub after: u64,
+}
+
+/// Compress the raw engine answers and the results index of runs whose
+/// last round is older than `days`; pages, summaries and syntheses stay as
+/// they are. Each copy is read back before its original goes. Runs still
+/// fetching or writing a synthesis are left alone.
+pub fn compress_old(days: u64) -> Compressed {
+    let mut done = Compressed::default();
+    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(days * 86_400);
+    let Ok(entries) = std::fs::read_dir(runs_root()) else { return done };
+    for e in entries.flatten() {
+        let dir = e.path();
+        let last = (1..1000)
+            .map(|n| dir.join(format!("request.r{n}.json")))
+            .take_while(|p| p.exists())
+            .last()
+            .and_then(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+        let Some(last) = last else { continue };
+        if last > cutoff || crate::finish::is_running(&dir) || dir.join(crate::synth::RUNNING).exists() {
+            continue;
+        }
+        let mut files: Vec<PathBuf> = vec![dir.join("results.jsonl")];
+        if let Ok(raw) = std::fs::read_dir(dir.join("raw")) {
+            files.extend(raw.flatten().map(|f| f.path()));
+        }
+        let mut any = false;
+        for f in files {
+            if !f.is_file() || f.extension().is_some_and(|x| x == "zst") {
+                continue;
+            }
+            let Ok(data) = std::fs::read(&f) else { continue };
+            let Ok(packed) = zstd::encode_all(&data[..], 9) else { continue };
+            let ok = zstd::decode_all(&packed[..]).is_ok_and(|back| back == data);
+            if !ok || std::fs::write(zst_path(&f), &packed).is_err() {
+                continue;
+            }
+            if std::fs::remove_file(&f).is_ok() {
+                done.files += 1;
+                done.before += data.len() as u64;
+                done.after += packed.len() as u64;
+                any = true;
+            }
+        }
+        done.runs += usize::from(any);
+    }
+    done
+}
+
 /// One line per run round in `<archive>/runs.jsonl`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunLine {

@@ -1,9 +1,9 @@
 [package]
 name = "omnisearch"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "OmniSearch (osearch): one web-research CLI. Based on paperfoot/search-cli (MIT), see UPSTREAM.md"
-license = "MIT"
+license = "AGPL-3.0-only"
 publish = false
 
 [[bin]]
@@ -53,6 +53,8 @@ encoding_rs = "0.8"
 uuid = { version = "1", features = ["v4"] }
 http = "1"
 regex = "1"
+# Old runs' raw answers and results index, compressed on request.
+zstd = "0.13"
 chromey = { version = "2", default-features = false }
 futures-util = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

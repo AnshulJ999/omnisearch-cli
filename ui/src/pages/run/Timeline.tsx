@@ -2,6 +2,7 @@ import ReactECharts from "echarts-for-react";
 import { useMemo } from "react";
 import { Card, CardHead, Empty, ErrorBox, Loading } from "@/components/ui";
 import { ms } from "@/lib/format";
+import { useDark } from "@/lib/theme";
 import { useCalls } from "./data";
 
 function color(status: number | null, dark: boolean) {
@@ -13,7 +14,7 @@ function color(status: number | null, dark: boolean) {
 /** Every outside call of the run on one time axis: searches, then page fetches. */
 export default function Timeline({ id }: { id: string }) {
   const calls = useCalls(id);
-  const dark = document.documentElement.classList.contains("dark");
+  const dark = useDark();
   const model = useMemo(() => {
     const list = (calls.data ?? []).map((c) => ({ ...c, start: c.ts * 1000 - c.elapsed_ms, end: c.ts * 1000 }));
     if (!list.length) return null;
@@ -33,7 +34,15 @@ export default function Timeline({ id }: { id: string }) {
       };
     });
     const span = Math.max(...list.map((c) => c.end)) - t0;
-    return { lanes, data, span, count: list.length };
+    // Time when at least one call was open: the hours between rounds do not count.
+    let active = 0;
+    let open = -Infinity;
+    for (const c of [...list].sort((a, b) => a.start - b.start)) {
+      if (c.end <= open) continue;
+      active += c.end - Math.max(c.start, open);
+      open = c.end;
+    }
+    return { lanes, data, span, active, count: list.length };
   }, [calls.data, dark]);
 
   if (calls.isLoading) return <Loading what="the calls" />;
@@ -64,7 +73,10 @@ export default function Timeline({ id }: { id: string }) {
   };
   return (
     <Card>
-      <CardHead title={`${model.count} calls over ${ms(model.span)}`} hint="Each bar is one call to an engine or fetcher, from when it was sent to its answer. Green answered, red refused, amber gave nothing. Scroll to zoom; hover for details. Times are to the second." />
+      <CardHead
+        title={model.span > model.active * 1.5 ? `${model.count} calls, ${ms(model.active)} of activity over ${ms(model.span)}` : `${model.count} calls over ${ms(model.span)}`}
+        hint="Each bar is one call to an engine or fetcher, from when it was sent to its answer. Green answered, red refused, amber gave nothing. Activity counts only the time a call was open, so gaps between rounds are left out. Scroll to zoom; hover for details. Times are to the second."
+      />
       <div className="p-2">
         <ReactECharts option={option} style={{ height: Math.max(260, model.lanes.length * 22 + 70) }} notMerge />
       </div>

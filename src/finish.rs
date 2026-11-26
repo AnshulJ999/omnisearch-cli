@@ -42,6 +42,11 @@ fn rounds_in(dir: &std::path::Path) -> Vec<usize> {
     rounds
 }
 
+/// Whether this round of the run has a background fetch going.
+pub fn round_running(dir: &std::path::Path, round: usize) -> bool {
+    dir.join(running(round)).exists()
+}
+
 /// Whether any round of the run still has a background fetch going.
 pub fn is_running(dir: &std::path::Path) -> bool {
     !rounds_in(dir).is_empty()

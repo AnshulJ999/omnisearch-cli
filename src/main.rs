@@ -337,7 +337,23 @@ async fn run(cli: Cli, app: Arc<AppContext>) -> Result<i32, errors::SearchError>
             print!("{}", reading::grep(&pattern, run.as_deref(), max)?);
             Ok(0)
         }
-        Commands::Runs { find, limit } => {
+        Commands::Runs { compress: true, .. } => {
+            let days = config::get().research.compressafter;
+            if days == 0 {
+                println!("Compression is off: set research.compressafter to a number of days first (`osearch config set research.compressafter 30`).");
+                return Ok(2);
+            }
+            let c = run::compress_old(days);
+            println!(
+                "Compressed {} files in {} runs older than {days} days: {:.1} MB to {:.1} MB. Pages, summaries and syntheses are unchanged; osearch reads the compressed files as before.",
+                c.files,
+                c.runs,
+                c.before as f64 / 1e6,
+                c.after as f64 / 1e6
+            );
+            Ok(0)
+        }
+        Commands::Runs { find, limit, .. } => {
             print!("{}", reading::runs(find.as_deref(), limit));
             Ok(0)
         }
@@ -384,7 +400,7 @@ async fn run(cli: Cli, app: Arc<AppContext>) -> Result<i32, errors::SearchError>
             }
             Ok(0)
         }
-        Commands::Synth { run, wait } => synth::command(app, run, wait).await,
+        Commands::Synth { run, wait, all } => synth::command(app, run, wait, all).await,
         Commands::Wait { run, jina_deepsearch } => wait::command(run, jina_deepsearch).await,
         Commands::Replay { run, top } => replay::command(&app, run, top).await,
         #[cfg(feature = "ui")]

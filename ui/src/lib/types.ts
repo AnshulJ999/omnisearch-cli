@@ -104,9 +104,27 @@ export interface RunDetail {
   index: { round: number; ts: number; topic: string; urls: number; pages: number; cost_usd: number; kind: string }[];
   summary: string | null;
   synthesis: string | null;
+  syntheses?: { tag: string; label: string; text: string | null; figures: SynthesisFigures | null }[];
   synthesis_running: boolean;
   jina_running: boolean;
   pages: PageEntry[];
+}
+
+/** What a synthesis was sent and what it cost (synthesis.rN.json). */
+export interface SynthesisFigures {
+  question?: string;
+  scope?: string;
+  model?: string;
+  earlier_rounds?: number;
+  tokens_in?: number;
+  tokens_out?: number;
+  cost_usd?: number;
+  cost_estimated?: boolean;
+  secs?: number;
+  quotes?: number;
+  quotes_found?: number;
+  pages?: { sent?: number; as_excerpts?: number; left_out?: number; still_fetching?: number };
+  sent_as?: { id: string; round?: number; sent: string; tokens?: number }[];
 }
 
 export interface Call {
@@ -146,6 +164,7 @@ export interface ResultRow {
 
 export interface Setting {
   key: string;
+  name: string;
   group: string;
   kind: "number" | "bool" | "text" | "list" | "choice";
   options: string[];
@@ -155,6 +174,7 @@ export interface Setting {
 export interface ConfigAnswer {
   path: string;
   values: Record<string, Record<string, unknown>>;
+  defaults: Record<string, Record<string, unknown>>;
   settings: Setting[];
 }
 
@@ -203,6 +223,8 @@ export interface EngineRow {
   per_call_usd: number;
   modes: string[];
   optional: boolean;
+  /** The balance this engine draws on (several share ScrapeCreators'). */
+  balance: string;
 }
 
 export interface BalanceStatus {

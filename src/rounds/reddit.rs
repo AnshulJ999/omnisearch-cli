@@ -52,7 +52,13 @@ pub fn web(
 
 
 /// Subreddits searched inside per community question, at most.
-const MAX_SUBS: usize = 4;
+fn max_subs() -> usize {
+    crate::config::get().research.redditsubs
+}
+
+/// With side-by-side searches on, every other logged-in search goes
+/// through the main login.
+static NEXT_MAIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Reddit threads (subreddit, URL) among results.
 fn threads<'a>(items: impl Iterator<Item = &'a crate::types::SearchResult>) -> Vec<(String, String)> {
@@ -70,6 +76,8 @@ fn threads<'a>(items: impl Iterator<Item = &'a crate::types::SearchResult>) -> V
 
 /// A logged-in search through the run account; when that fails, through
 /// the main login within the run's allowance (`calls` pages), with a note.
+/// Side by side (`research.redditsidebyside`), every other search goes
+/// through the main login first, within the same allowance.
 async fn logged_in<F, Fut>(search: F, calls: usize) -> (Result<Vec<crate::types::SearchResult>, String>, Option<String>)
 where
     F: Fn() -> Fut,
@@ -77,6 +85,16 @@ where
 {
     use crate::providers::reddit::{has_login, relogin_hint, run_account, take_main_calls};
     let run = run_account();
+    let side = crate::config::get().research.redditsidebyside && run != "main" && has_login("main") && has_login(&run);
+    if side && NEXT_MAIN.fetch_xor(true, std::sync::atomic::Ordering::Relaxed) && take_main_calls(calls) {
+        return match crate::cookies::with_account("main", search()).await {
+            Ok(v) => (Ok(v), None),
+            Err(e) => {
+                let r = crate::cookies::with_account(&run, search()).await;
+                (r, Some(format!("a side-by-side search through the main Reddit login failed ({e}); the {run} login took it")))
+            }
+        };
+    }
     let first = if has_login(&run) {
         crate::cookies::with_account(&run, search()).await
     } else {
@@ -185,7 +203,7 @@ async fn discover(app: Arc<AppContext>, query: &str, no_cache: bool) -> Vec<Stri
 
 /// Search inside each of the question's subreddits: those the request
 /// named, the two its threads came from most, then ones found by name, at
-/// most `MAX_SUBS`. With the login, Reddit's own search there (top of the
+/// most `research.redditsubs`. With the login, Reddit's own search there (top of the
 /// year, or the most relevant of the `-f` period); without it, each one's
 /// top threads of the year, on topic only.
 #[allow(clippy::too_many_arguments)]
@@ -199,10 +217,14 @@ async fn subreddits(
     no_cache: bool,
 ) -> RoundOut {
     let mut out = RoundOut::default();
+    let max = max_subs();
+    if max == 0 {
+        return out;
+    }
     let mut subs: Vec<(String, &'static str)> = Vec::new();
     let add = |subs: &mut Vec<(String, &'static str)>, s: &str, why: &'static str| {
         let s = s.trim().trim_start_matches('/').trim_start_matches("r/").trim_end_matches('/');
-        if !s.is_empty() && subs.len() < MAX_SUBS && !subs.iter().any(|(x, _)| x.eq_ignore_ascii_case(s)) {
+        if !s.is_empty() && subs.len() < max && !subs.iter().any(|(x, _)| x.eq_ignore_ascii_case(s)) {
             subs.push((s.to_string(), why));
         }
     };
@@ -212,7 +234,7 @@ async fn subreddits(
     for s in &from_threads {
         add(&mut subs, s, "threads");
     }
-    if subs.len() < MAX_SUBS {
+    if subs.len() < max {
         let rec = Some(recorder.labeled(&format!("{}s", p.label)));
         for s in raw::scope(rec, discover(app.clone(), &p.query, no_cache)).await {
             add(&mut subs, &s, "found");
@@ -366,6 +388,25 @@ pub async fn round(
                 .map_err(|e| crate::errors::SearchError::Config(format!("logged-in Reddit search failed: {e}")));
             RoundOut { responses: vec![(label, r)], notes: note.into_iter().collect(), ..RoundOut::default() }
         }));
+        // Reddit's comment search: threads whose answer is in a reply.
+        if rc.redditcomments {
+            let label = format!("{}e", p.label);
+            let q = format!("comments: {}", p.query);
+            out.planned.push(Planned::local(p, label.clone(), q.clone(), Mode::Community, "reddit-login", SAME));
+            let (query, freshness) = (p.query.clone(), p.opts.freshness.clone());
+            let rec = Some(recorder.labeled(&label));
+            set.spawn(raw::scope(rec, async move {
+                let (r, note) = logged_in(
+                    || crate::providers::reddit::login_comment_search(&query, 25, freshness.as_deref()),
+                    1,
+                )
+                .await;
+                let r = r
+                    .map(|results| local_response("reddit-login", &q, Mode::Community, results))
+                    .map_err(|e| crate::errors::SearchError::Config(format!("logged-in Reddit comment search failed: {e}")));
+                RoundOut { responses: vec![(label, r)], notes: note.into_iter().collect(), ..RoundOut::default() }
+            }));
+        }
     }
     while let Some(joined) = set.join_next().await {
         if let Ok(part) = joined {

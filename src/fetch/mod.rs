@@ -291,8 +291,13 @@ fn check(requested: &str, mut got: Got) -> TierResult {
     }
     // XenForo's error page for refused clients comes with the whole forum
     // layout, too long for the challenge check.
-    if got.title.trim().to_ascii_lowercase().starts_with("oops! we ran into some problems") {
+    let title = got.title.trim().to_ascii_lowercase();
+    if title.starts_with("oops! we ran into some problems") {
         return Err((Miss::Wall, "the forum served its error page".into()));
+    }
+    // A reader's copy of a challenge page keeps its title, not its markup.
+    if title.starts_with("just a moment") || (title.starts_with("attention required") && title.contains("cloudflare")) {
+        return Err((Miss::Wall, format!("a challenge page (\"{}\")", got.title.trim())));
     }
     if crate::cookies::looks_like_login_wall(requested, &got.final_url, &got.markdown) {
         return Err((Miss::Login, format!("a sign-in page at {}", got.final_url)));

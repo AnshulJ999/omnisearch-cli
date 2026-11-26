@@ -4,7 +4,10 @@ import { cn } from "@/lib/format";
 
 /** Markdown from a run. Citations like [p3#4] become buttons that open the page section. */
 export default function Markdown({ text, onCite, className }: { text: string; onCite?: (page: string, section?: number) => void; className?: string }) {
-  const linked = onCite ? text.replace(/\[(p\d+)(?:#(\d+))?\](?!\()/g, (_m, p, s) => `[${p}${s ? "#" + s : ""}](#cite-${p}${s ? "-" + s : ""})`) : text;
+  // A tag alone on its line (the synthesis's <short>, <full>) would start an
+  // HTML block that swallows the paragraph after it; it becomes a blank line.
+  const plain = text.replace(/^[ \t]*<\/?[a-z_][a-z0-9_-]*>[ \t]*$/gim, "");
+  const linked = onCite ? plain.replace(/\[(p\d+)(?:#(\d+))?\](?!\()/g, (_m, p, s) => `[${p}${s ? "#" + s : ""}](#cite-${p}${s ? "-" + s : ""})`) : plain;
   return (
     <div className={cn("prose-md", className)}>
       <ReactMarkdown
